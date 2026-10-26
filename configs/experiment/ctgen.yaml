@@ -1,0 +1,23 @@
+# @package _global_
+# CT-Gen submission model: full CT-RATE train set, 2 GPUs x batch 12, 150 epochs.
+defaults:
+  - override /data: ctgen
+  - override /model: ctgen
+
+task_name: ctgen
+
+data:
+  batch_size: 12
+
+model:
+  lr: 3e-4
+  warmup_steps: 1000
+
+callbacks:
+  ema:
+    decay: 0.999
+
+trainer:
+  devices: 2
+  strategy: ddp
+  max_epochs: 150

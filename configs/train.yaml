@@ -1,0 +1,15 @@
+# python src/train.py experiment=ctgen   |   python src/train.py experiment=mrgen
+defaults:
+  - _self_
+  - data: null
+  - model: null
+  - callbacks: default
+  - logger: csv
+  - trainer: default
+  - paths: default
+  - hydra: default
+  - experiment: null
+
+task_name: train
+seed: 42
+ckpt_path: null   # resume from a Lightning checkpoint

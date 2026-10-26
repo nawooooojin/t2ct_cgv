@@ -1,0 +1,50 @@
+# CT-Gen: Report2CT U-Net on the Wan2.1 latent + REPA with a frozen SPECTRE teacher.
+_target_: src.models.module.Report2VolumeModule
+lr: 2e-4
+cfg_drop_prob: 0.15
+text_condition: pooled        # context = [findings, impression] pooled 3-encoder vectors (B, 2, 2560)
+text_pooled_cond: false
+modality_class_label: 1       # CT
+lr_scheduler_power: 2.0
+warmup_steps: 500
+
+unet:
+  _target_: monai.apps.generation.maisi.networks.diffusion_model_unet_maisi.DiffusionModelUNetMaisi
+  spatial_dims: 3
+  in_channels: 16             # Wan2.1 latent channels
+  out_channels: 16
+  num_channels: [64, 128, 256, 512]
+  num_res_blocks: 2
+  attention_levels: [false, false, true, true]
+  num_head_channels: [0, 0, 32, 32]
+  cross_attention_dim: 2560
+  num_class_embeds: 128
+  include_fc: true
+  include_spacing_input: true
+  include_top_region_index_input: false
+  include_bottom_region_index_input: false
+  resblock_updown: true
+  with_conditioning: true
+  use_flash_attention: true
+
+noise_scheduler:
+  _target_: src.models.rflow.RFlowScheduler
+  num_train_timesteps: 1000
+  scale: 1.4
+  use_timestep_transform: true
+  use_discrete_timesteps: false
+  sample_method: uniform
+
+repa:
+  _target_: src.models.repa.RepaAligner
+  student_channels: 512       # middle_block channels
+  teacher_dim: 1080           # SPECTRE ViT-L
+  teacher_grid: [16, 16, 16]
+  student_grid: [8, 8, 8]
+  spatial_norm_teacher: true
+  gamma: 1.0
+  hard_weight: 1.0            # L_REPA (token-wise cosine)
+  rel_weight: 3.0             # w, L_ML (pairwise similarity)
+  rel_tokens: 1024            # tokens sampled per step for L_ML
+repa_weight: 0.5              # lambda
+repa_tap: middle_block

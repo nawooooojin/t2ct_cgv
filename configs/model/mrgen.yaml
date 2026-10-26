@@ -1,0 +1,18 @@
+# MR-Gen: same latent space / scheduler / REPA as CT-Gen. Text conditioning uses RadFinder:
+#   local  : layer-aggregated token sequence (L, 1024) -> cross-attention (masked)
+#   global : [EOS, mean] per section (2048 x 2) -> zero-init Linear added to the time embedding
+# ResBlocks use AdaGN. The (sequence, plane) class label comes from the batch.
+defaults:
+  - ctgen
+
+text_condition: sequence
+text_pooled_cond: true
+
+unet:
+  _target_: src.models.unet.DiffusionModelUNetMaisiTextPooledAdaGN
+  cross_attention_dim: 1024
+  text_pooled_dim: 4096
+  text_pooled_concat: true
+
+repa:
+  rel_tokens: null            # all 4096 teacher tokens

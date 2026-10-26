@@ -1,0 +1,21 @@
+# @package _global_
+# MR-Gen submission model: 1,200 MR-RATE studies (~8.5k series), effective batch 32.
+defaults:
+  - override /data: mrgen
+  - override /model: mrgen
+
+task_name: mrgen
+
+data:
+  batch_size: 8
+
+model:
+  lr: 4e-4
+  warmup_steps: 1000
+
+trainer:
+  devices: 4
+  strategy: ddp
+  precision: 16-mixed
+  gradient_clip_val: 5.0
+  max_epochs: 300

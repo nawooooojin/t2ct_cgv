@@ -1,0 +1,5 @@
+wandb:
+  _target_: lightning.pytorch.loggers.wandb.WandbLogger
+  save_dir: ${paths.output_dir}
+  project: vlm3d2026
+  name: ${task_name}

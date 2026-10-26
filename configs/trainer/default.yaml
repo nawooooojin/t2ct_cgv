@@ -1,0 +1,10 @@
+_target_: lightning.pytorch.trainer.Trainer
+default_root_dir: ${paths.output_dir}
+accelerator: gpu
+devices: 1
+strategy: auto
+precision: bf16-mixed
+min_epochs: 1
+max_epochs: 300
+check_val_every_n_epoch: 5
+log_every_n_steps: 50

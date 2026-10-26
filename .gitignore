@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+data/
+outputs/
+weights/
+work/
+third_party/
+*.ckpt
+*.npy
+*.npz
+*.nii.gz
+.venv*/

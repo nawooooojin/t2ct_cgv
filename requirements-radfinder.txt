@@ -1,0 +1,10 @@
+# MR-Gen text encoding only (RadFinder needs transformers >= 5)
+torch==2.7.0
+transformers>=5.0
+accelerate
+safetensors
+huggingface_hub
+numpy
+pandas
+rootutils==1.0.7
+tqdm
