@@ -1,5 +1,7 @@
 # @package _global_
-# MR-Gen submission model: 1,200 MR-RATE studies (~8.5k series), effective batch 32.
+# MR-Gen submission model: 1,200 MR-RATE studies (~8.5k series), 4 GPUs x batch 2 (effective 8).
+# The LR schedule is set for 150 epochs; the submitted weights are the EMA after 115 epochs
+# (checkpoints/epoch_114.ckpt, saved by `submission_checkpoint`).
 defaults:
   - override /data: mrgen
   - override /model: mrgen
@@ -7,15 +9,26 @@ defaults:
 task_name: mrgen
 
 data:
-  batch_size: 8
+  batch_size: 2
 
 model:
-  lr: 4e-4
+  lr: 2e-4
   warmup_steps: 1000
+
+callbacks:
+  submission_checkpoint:
+    _target_: lightning.pytorch.callbacks.ModelCheckpoint
+    dirpath: ${paths.output_dir}/checkpoints
+    filename: "epoch_{epoch:03d}"
+    auto_insert_metric_name: false
+    monitor: null
+    every_n_epochs: 115
+    save_on_train_epoch_end: true  # independent of the validation schedule
+    save_top_k: -1
 
 trainer:
   devices: 4
   strategy: ddp
   precision: 16-mixed
   gradient_clip_val: 5.0
-  max_epochs: 300
+  max_epochs: 150

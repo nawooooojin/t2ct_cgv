@@ -60,11 +60,14 @@ python scripts/preprocess/build_datalist.py --task <task> --root data/<task> --i
 ```bash
 python src/train.py experiment=ctgen
 python src/train.py experiment=mrgen
-python scripts/extract_ema.py <run>/checkpoints/last.ckpt weights/<task>_ema.ckpt
+python scripts/extract_ema.py <run>/checkpoints/last.ckpt weights/ctgen_ema.ckpt
+python scripts/extract_ema.py <run>/checkpoints/epoch_114.ckpt weights/mrgen_ema.ckpt
 ```
 
 Settings are in `configs/experiment/*.yaml` and `configs/model/*.yaml`. WARP-CT: 150 epochs, batch 24
-(2 GPUs), Adam lr 3e-4, bf16, EMA 0.999. WARP-MR: 115 epochs, batch 32.
+(2 GPUs), Adam lr 3e-4, bf16, EMA 0.999. WARP-MR: batch 8 (4 GPUs x 2), Adam lr 2e-4, fp16 mixed,
+gradient clipping 5, EMA 0.9999, LR schedule for 150 epochs; the submission uses the weights after
+115 epochs (`epoch_114.ckpt`).
 
 ## Inference
 
