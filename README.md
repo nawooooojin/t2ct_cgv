@@ -18,7 +18,7 @@ Team CGV code for the MICCAI 2026 VLM3D Challenge.
   percentile intensity normalization.
 
 Pretrained models (all frozen): [Wan2.1 VAE](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers),
-[SPECTRE](https://huggingface.co/cclaess/SPECTRE) (`spectre_backbone_vit_large_patch16_128_no_vla.pt`, training only),
+[SPECTRE-Large](https://huggingface.co/cclaess/SPECTRE-Large) (`spectre_backbone_vit_large_patch16_128_no_vla.pt`, training only),
 MedEmbed-large-v0.1 / ClinicalBERT / BiomedVLP-CXR-BERT-specialized (CT), [RadFinder](https://huggingface.co/lmb-freiburg/radfinder) (MR).
 The U-Nets are trained from scratch.
 
