@@ -2,10 +2,10 @@
 
 Team CGV (Woojin Na, Hyunjun Park, Jinah Park; KAIST) code for the MICCAI 2026 VLM3D Challenge.
 
-| Track | Submission | Hidden test result |
-|---|---|---|
-| CT Volume Generation | `1b8cdaee` | 1st. FVD 0.2799, FID 2.5D 54.40, CT-CLIP 52.48 |
-| MR Volume Generation | `94215494` | 2nd of 4. SSIM 0.4891, PSNR 13.49, MSE 0.0466, FID 2.5D 263.5 |
+| Track | Hidden test result |
+|---|---|
+| CT Volume Generation | 1st. FVD 0.2799, FID 2.5D 54.40, CT-CLIP 52.48 |
+| MR Volume Generation | 2nd of 4. SSIM 0.4891, PSNR 13.49, MSE 0.0466, FID 2.5D 263.5 |
 
 ## Method
 
