@@ -9,11 +9,11 @@ Team CGV code for the MICCAI 2026 VLM3D Challenge.
 
 ## Method
 
-- **CT-Gen**: Report2CT (latent diffusion, 3D U-Net, three frozen text encoders) with two changes.
+- **WARP-CT**: Report2CT (latent diffusion, 3D U-Net, three frozen text encoders) with two changes.
   The MAISI VAE is replaced by the frozen Wan2.1 VAE (latent 16 x 64^3), and REPA is added during
   training: the U-Net middle block is aligned to frozen SPECTRE ViT-L tokens with the U-REPA loss
   (`L = L_velocity + 0.5 (L_REPA + 3 L_ML)`).
-- **MR-Gen**: the same framework, with RadFinder text conditioning (token sequence to
+- **WARP-MR**: the same framework, with RadFinder text conditioning (token sequence to
   cross-attention, pooled vector to AdaGN), a (sequence, plane) class label, and per-volume
   percentile intensity normalization.
 
@@ -63,8 +63,8 @@ python src/train.py experiment=mrgen
 python scripts/extract_ema.py <run>/checkpoints/last.ckpt weights/<task>_ema.ckpt
 ```
 
-Settings are in `configs/experiment/*.yaml` and `configs/model/*.yaml`. CT-Gen: 150 epochs, batch 24
-(2 GPUs), Adam lr 3e-4, bf16, EMA 0.999. MR-Gen: 115 epochs, batch 32.
+Settings are in `configs/experiment/*.yaml` and `configs/model/*.yaml`. WARP-CT: 150 epochs, batch 24
+(2 GPUs), Adam lr 3e-4, bf16, EMA 0.999. WARP-MR: 115 epochs, batch 32.
 
 ## Inference
 
