@@ -19,6 +19,7 @@ guidance 5 (unconditional branch = zeroed text). CT volumes are 512 x 512 x 253 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -55,6 +56,11 @@ def split_ct_report(report: str) -> tuple[str, str]:
         return text, ""
     findings = text[(m_f.end() if m_f else 0):(m_i.start() if m_i else len(text))].strip()
     return findings, text[m_i.end():].strip() if m_i else ""
+
+
+def noise_seed(stem: str, seed: int) -> int:
+    """Per-case seed: the same (case, seed) pair always starts from the same noise."""
+    return int.from_bytes(hashlib.sha256(f"{stem}|{seed}".encode()).digest()[:8], "big")
 
 
 def case_stem(name: str) -> str:
@@ -127,7 +133,8 @@ def main() -> None:
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--steps", type=int, default=None, help="default: 50 (ctgen) / 100 (mrgen)")
     ap.add_argument("--cfg", type=float, default=5.0)
-    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--seed", type=int, default=None, help="fix the initial noise of every case")
+    ap.add_argument("--save-latents", action="store_true", help="also save <stem>.npy latents (16, 64, 64, 64)")
     ap.add_argument("--spacing", type=float, nargs=3, default=[0.75, 0.75, 1.3], help="ctgen output spacing (mm)")
     ap.add_argument("--text-dir", help="mrgen: RadFinder features of the prompts")
     ap.add_argument("--spacing-table", help="mrgen: spacing_table.json")
@@ -137,8 +144,6 @@ def main() -> None:
 
     device = torch.device(args.device)
     steps = args.steps or (50 if args.task == "ctgen" else 100)
-    if args.seed is not None:
-        torch.manual_seed(args.seed)
     torch.backends.cuda.enable_flash_sdp(False)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -177,8 +182,12 @@ def main() -> None:
             label = mr_rate.class_label(stem)
             spacing = spacing_table[label]
 
+        if args.seed is not None:
+            torch.manual_seed(noise_seed(stem, args.seed))
         with torch.autocast(device.type, dtype=torch.bfloat16):
             z = denoise(unet, scale_factor, cond, label, spacing, steps, args.cfg, device)
+        if args.save_latents:
+            np.save(out_dir / f"{stem}.npy", z.cpu().numpy())
         vol = vae.decode(z, intensity="hu" if args.task == "ctgen" else "unit").numpy()  # (Z, X, Y)
         if args.task == "ctgen":
             save_ct(vol, spacing, out_path)
