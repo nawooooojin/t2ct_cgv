@@ -1,0 +1,6 @@
+_target_: src.data.datamodule.VolumeDataModule
+datalist_path: ${paths.data_dir}/ctgen/datalist.json
+task: ctgen
+batch_size: 12
+num_workers: 16
+spacing_multiplier: 100.0

@@ -1,0 +1,6 @@
+_target_: src.data.datamodule.VolumeDataModule
+datalist_path: ${paths.data_dir}/mrgen/datalist.json
+task: mrgen
+batch_size: 2
+num_workers: 8
+spacing_multiplier: 100.0
