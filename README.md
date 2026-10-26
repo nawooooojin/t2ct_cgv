@@ -74,20 +74,5 @@ python scripts/generate.py --task mrgen --ckpt weights/mrgen_ema.ckpt --prompts 
 
 CFG scale 5; 50 sampling steps for CT, 100 for MR.
 
-## Limitations
-
-- Report-only generation; exact lesion location and size are not reliably reproduced, and quality drops
-  for reports with many findings.
-- MR spacing and orientation come from per-class training statistics, not from the target scan.
-- SPECTRE is a CT model and is used as the teacher for MR as well.
-- Only CT-RATE / MR-RATE were used; other sites and scanners were not tested.
-
-## Weights and license
-
-Trained weights are not released (the SPECTRE teacher weights are CC-BY-NC-SA). Code is MIT; `src/models/rflow.py`
-is adapted from the MONAI MAISI bundle (Apache-2.0). Pretrained models and datasets keep their own terms.
-
 References: Report2CT (arXiv:2509.14780), MAISI (WACV 2025), Wan (arXiv:2503.20314), U-REPA (NeurIPS 2025),
 SPECTRE (CVPR 2026), RadFinder (arXiv:2603.02026).
-
-This work was supported by IITP grant funded by the Korea government (MSIT) (No. 00223446).
