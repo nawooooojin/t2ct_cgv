@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import json
 import re
+import sys
 from pathlib import Path
 
 import nibabel as nib
@@ -65,6 +66,21 @@ def noise_seed(stem: str, seed: int) -> int:
 
 def case_stem(name: str) -> str:
     return name[: -len(".nii.gz")] if name.endswith(".nii.gz") else Path(name).stem
+
+
+def class_table_entry(table: dict, label: int, stem: str):
+    """``table[label]``; a class missing from the table (never seen in training, e.g. swi-sag) falls
+    back to the same sequence's axial class, any plane of that sequence, t2w-axi, then the first entry."""
+    if label in table:
+        return table[label]
+    if not table:
+        raise ValueError(f"empty lookup table (first case: {stem})")
+    mod, _ = list(mr_rate.CLASS_LABELS)[label]
+    candidates = [mr_rate.CLASS_LABELS[(mod, p)] for p in ("axi", *mr_rate.PLANES)]
+    candidates += [mr_rate.CLASS_LABELS[("t2w", "axi")], next(iter(table))]
+    used = next(c for c in candidates if c in table)
+    print(f"{stem}: class {label} is not in the table, using class {used}", file=sys.stderr)
+    return table[used]
 
 
 def load_unet(ckpt_path: str, task: str, device: torch.device):
@@ -114,15 +130,16 @@ def save_ct(hu_zxy: np.ndarray, spacing_mm, out_path: Path) -> None:
 
 
 def save_mr(vol_zxy: np.ndarray, spacing_mm, axcodes, out_path: Path) -> None:
-    """Decoded (Z, X, Y) RAS volume in [-1, 1] -> [0, 1] array reoriented to `axcodes`."""
-    vol = vol_zxy.transpose(1, 2, 0)  # (X, Y, Z)
+    """Decoded (Z, X, Y) RAS volume in [-1, 1] -> [0, 1] array reoriented to `axcodes`.
+
+    The scorer reads the raw array, so the array itself is permuted/flipped; `as_reoriented` keeps
+    the affine (spacing order, signs, origin) consistent with it.
+    """
+    vol = np.clip((vol_zxy.transpose(1, 2, 0).astype(np.float32) + 1.0) / 2.0, 0.0, 1.0)  # (X, Y, Z)
     ornt = nib.orientations.ornt_transform(nib.orientations.axcodes2ornt(("R", "A", "S")),
                                            nib.orientations.axcodes2ornt(tuple(axcodes)))
-    vol = nib.orientations.apply_orientation(vol, ornt)
-    vol = np.clip((vol.astype(np.float32) + 1.0) / 2.0, 0.0, 1.0)
-    signs = [-1.0 if a in ("L", "P", "I") else 1.0 for a in axcodes]
-    affine = np.diag([signs[0] * spacing_mm[0], signs[1] * spacing_mm[1], signs[2] * spacing_mm[2], 1.0])
-    nib.save(nib.Nifti1Image(vol, affine), str(out_path))
+    img = nib.Nifti1Image(vol, np.diag([spacing_mm[0], spacing_mm[1], spacing_mm[2], 1.0])).as_reoriented(ornt)
+    nib.save(img, str(out_path))
 
 
 def main() -> None:
@@ -169,6 +186,11 @@ def main() -> None:
             cond = {"context": torch.stack([f, i])[None].to(device)}  # (1, 2, 2560)
             label, spacing = CT_CLASS_LABEL, list(args.spacing)
         else:
+            try:
+                label = mr_rate.class_label(stem)
+            except ValueError:  # unscored sequence (e.g. dwi) or unparseable name: not scored, skipped
+                print(f"skip {stem}: not a scored MR-Gen (sequence, plane)", file=sys.stderr)
+                continue
             npz = np.load(Path(args.text_dir) / f"{stem}_rf_navg.npz")
             seqs, pooled = [], {}
             for short, section in (("f", "findings"), ("i", "impression")):
@@ -179,8 +201,7 @@ def main() -> None:
             context = torch.cat(seqs)[None]  # (1, L_f + L_i, 1024)
             cond = {"context": context, "context_mask": torch.ones(context.shape[:2], dtype=torch.bool), **pooled}
             cond = {k: v.to(device) for k, v in cond.items()}
-            label = mr_rate.class_label(stem)
-            spacing = spacing_table[label]
+            spacing = class_table_entry(spacing_table, label, stem)
 
         if args.seed is not None:
             torch.manual_seed(noise_seed(stem, args.seed))
@@ -192,7 +213,7 @@ def main() -> None:
         if args.task == "ctgen":
             save_ct(vol, spacing, out_path)
         else:
-            save_mr(vol, spacing, axcodes_table[label], out_path)
+            save_mr(vol, spacing, class_table_entry(axcodes_table, label, stem), out_path)
 
 
 if __name__ == "__main__":
