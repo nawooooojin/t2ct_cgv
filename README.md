@@ -1,6 +1,6 @@
 # t2ct_cgv
 
-Team CGV (Woojin Na, Hyunjun Park, Jinah Park; KAIST) code for the MICCAI 2026 VLM3D Challenge.
+Team CGV (KAIST) code for the MICCAI 2026 VLM3D Challenge.
 
 | Track | Hidden test result |
 |---|---|
