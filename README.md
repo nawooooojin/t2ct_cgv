@@ -82,3 +82,11 @@ CFG scale 5; 50 sampling steps for CT, 100 for MR.
 
 References: Report2CT (arXiv:2509.14780), MAISI (WACV 2025), Wan (arXiv:2503.20314), U-REPA (NeurIPS 2025),
 SPECTRE (CVPR 2026), RadFinder (arXiv:2603.02026).
+
+## Notes
+
+- Team CGV.
+- Evaluation: official VLM3D metrics (CT: FVD, FID 2.5D, CT-CLIP score; MR: SSIM, PSNR, MSE, FID 2.5D). Local checks used 300 CT-RATE validation cases and 150 held-out MR-RATE studies.
+- Final weights: not available. Configs: `configs/experiment/ctgen.yaml` (WARP-CT), `configs/experiment/mrgen.yaml` (WARP-MR).
+- Limitations: report-only generation, so lesion location and size are not reliably reproduced; trained and tested on CT-RATE / MR-RATE only.
+- Usage terms: code under MIT (`LICENSE`); pretrained models and datasets keep their own licenses (SPECTRE weights are CC-BY-NC-SA).
