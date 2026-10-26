@@ -3,7 +3,7 @@
 Writes ``<out-dir>/<id>_text.json`` = {"findings_embeddings": [2560], "impression_embeddings": [2560]}
 from the CT-RATE report CSV (columns VolumeName, Findings_EN, Impressions_EN).
 
-    python scripts/preprocess/encode_text_ctgen.py --ids data/ctgen/ids_train.txt \
+    python scripts/preprocess/encode_text_ctgen.py --ids ids/ctrate_train.txt \
         --reports-csv /path/CT-RATE/dataset/radiology_text_reports/train_reports.csv \
         --out-dir data/ctgen/text
 """

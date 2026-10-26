@@ -4,7 +4,7 @@ For every id with a latent, writes ``<cond-dir>/<id>_cond.json`` (resampled spac
 header, plus the CT text embeddings for CT-Gen) and a datalist entry.
 
     python scripts/preprocess/build_datalist.py --task ctgen --root data/ctgen \
-        --ids-train data/ctgen/ids_train.txt --ids-valid data/ctgen/ids_valid.txt
+        --ids-train ids/ctrate_train.txt --ids-valid ids/ctrate_valid.txt
     python scripts/preprocess/build_datalist.py --task mrgen --root data/mrgen \
         --ids-train data/mrgen/ids_train.json --ids-valid data/mrgen/ids_valid.json --raw-dir data/mrgen/raw
 

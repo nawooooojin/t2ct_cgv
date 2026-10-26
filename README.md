@@ -25,27 +25,33 @@ The U-Nets are trained from scratch.
 ## Setup
 
 ```bash
+conda create -n t2ct python=3.11 -y && conda activate t2ct
 pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt && pip install --no-deps monai==1.4.0
-git clone https://github.com/cclaess/SPECTRE third_party/spectre      # commit c05af47
-python -m venv .venv-radfinder && .venv-radfinder/bin/pip install -r requirements-radfinder.txt   # MR text only
+git clone https://github.com/cclaess/SPECTRE third_party/spectre && git -C third_party/spectre checkout c05af47
+
+# MR text encoding only (RadFinder needs transformers >= 5)
+conda create -n t2ct-radfinder python=3.11 -y && conda activate t2ct-radfinder
+pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+pip install -r requirements-radfinder.txt
 ```
 
 ## Data and preprocessing
 
-- [CT-RATE](https://huggingface.co/datasets/ibrahimhamamci/CT-RATE): `train_fixed` volumes and English reports,
-  46,393 training volumes after removing out-of-FOV / unreadable ones.
+- [CT-RATE](https://huggingface.co/datasets/ibrahimhamamci/CT-RATE): `ids/ctrate_train.txt` (46,393 `train_fixed`
+  volumes, out-of-FOV / unreadable ones removed) and `ids/ctrate_valid.txt` (1,304, one per validation patient).
 - [MR-RATE](https://huggingface.co/datasets/Forithmus/MR-RATE): 1,200 studies (8,492 series) sampled from the
   train split, one study per patient, seed 42 (`scripts/preprocess/select_mrrate_subset.py`).
 
 Volumes are reoriented to RAS and resampled to 512 x 512 x 253, then encoded to Wan latents, SPECTRE
-tokens (16^3) and text features. Run each step for the train and valid id lists:
+tokens (16^3) and text features. Each script processes a whole id list; run it once per split (for CT-RATE,
+`ROOT` is `train_fixed` or `valid_fixed` and `CSV` is the matching report file).
 
 ```bash
 python scripts/preprocess/encode_wan_latents.py --ids IDS --data-root ROOT --layout {ctrate,mrrate} [--intensity unit] --out-dir data/<task>/latents
 python scripts/preprocess/encode_spectre.py     --ids IDS --data-root ROOT --layout {ctrate,mrrate} [--intensity unit] --ckpt SPECTRE_CKPT --out-dir data/<task>/spectre_ssl_16
-python scripts/preprocess/encode_text_ctgen.py  --ids IDS --reports-csv CSV --out-dir data/ctgen/text                       # CT
-.venv-radfinder/bin/python scripts/preprocess/encode_text_mrgen.py --ids IDS --reports-csv CSV --out-dir data/mrgen/text   # MR
+python scripts/preprocess/encode_text_ctgen.py  --ids IDS --reports-csv CSV --out-dir data/ctgen/text   # CT
+python scripts/preprocess/encode_text_mrgen.py  --ids IDS --reports-csv CSV --out-dir data/mrgen/text   # MR, in t2ct-radfinder
 python scripts/preprocess/build_datalist.py --task <task> --root data/<task> --ids-train IDS_TRAIN --ids-valid IDS_VALID [--raw-dir data/mrgen/raw]
 ```
 
@@ -67,7 +73,7 @@ per prompt (CT: HU, 512 x 512 x 253, 0.75/0.75/1.3 mm; MR: [0, 1]).
 
 ```bash
 python scripts/generate.py --task ctgen --ckpt weights/ctgen_ema.ckpt --prompts prompts.json --out-dir pred_ct
-.venv-radfinder/bin/python scripts/preprocess/encode_text_mrgen.py --prompts prompts.json --out-dir work/text
+python scripts/preprocess/encode_text_mrgen.py --prompts prompts.json --out-dir work/text   # in t2ct-radfinder
 python scripts/generate.py --task mrgen --ckpt weights/mrgen_ema.ckpt --prompts prompts.json --text-dir work/text \
     --spacing-table data/mrgen/spacing_table.json --axcodes-table data/mrgen/axcodes_table.json --out-dir pred_mr
 ```

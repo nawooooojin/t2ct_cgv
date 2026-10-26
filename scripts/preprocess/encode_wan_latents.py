@@ -6,7 +6,7 @@ NIfTI affine keeps the resampled voxel spacing, which build_datalist.py reads as
 condition.
 
     # CT-RATE (HU)
-    python scripts/preprocess/encode_wan_latents.py --ids data/ctgen/ids_train.txt \
+    python scripts/preprocess/encode_wan_latents.py --ids ids/ctrate_train.txt \
         --data-root /path/CT-RATE/dataset/train_fixed --layout ctrate --out-dir data/ctgen/latents
     # MR-RATE (per-volume percentile normalisation)
     python scripts/preprocess/encode_wan_latents.py --ids data/mrgen/ids_train.json \
