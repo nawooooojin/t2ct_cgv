@@ -26,13 +26,13 @@ The U-Nets are trained from scratch.
 
 ```bash
 conda create -n t2ct python=3.11 -y && conda activate t2ct
-pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt && pip install --no-deps monai==1.4.0
 git clone https://github.com/cclaess/SPECTRE third_party/spectre && git -C third_party/spectre checkout c05af47
 
 # MR text encoding only (RadFinder needs transformers >= 5)
 conda create -n t2ct-radfinder python=3.11 -y && conda activate t2ct-radfinder
-pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements-radfinder.txt
 ```
 

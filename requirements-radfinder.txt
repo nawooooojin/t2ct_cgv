@@ -1,6 +1,13 @@
 # MR-Gen text encoding only (RadFinder needs transformers >= 5)
 torch==2.7.0
+torchvision==0.22.0
 transformers>=5.0
+# imported by RadFinder's remote code
+timm
+monai
+loralib
+packg==0.35.2
+visiontext==0.35.3
 accelerate
 safetensors
 huggingface_hub

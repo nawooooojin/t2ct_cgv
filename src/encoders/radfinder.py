@@ -16,6 +16,7 @@ import torch
 from src.data.rf_navg import aggregate_layers, rms_normalize
 
 RADFINDER_REPO = "lmb-freiburg/radfinder"
+RADFINDER_REVISION = "fa74969fcbb7857b7c8792e09b20463f43329050"  # the revision the MR-Gen model was trained with
 QWEN3_TOKENIZER = "Qwen/Qwen3-Embedding-0.6B"
 
 
@@ -25,11 +26,12 @@ class RadFinderTextEncoder:
         from transformers import AutoModel, AutoTokenizer
 
         # the remote code imports the `radfinder` package shipped inside the model repo
-        snap = snapshot_download(RADFINDER_REPO, cache_dir=os.environ.get("HF_HUB_CACHE"))
+        snap = snapshot_download(RADFINDER_REPO, revision=RADFINDER_REVISION,
+                                 cache_dir=os.environ.get("HF_HUB_CACHE"))
         if snap not in sys.path:
             sys.path.insert(0, snap)
         self.tokenizer = AutoTokenizer.from_pretrained(QWEN3_TOKENIZER)
-        model = AutoModel.from_pretrained(RADFINDER_REPO, trust_remote_code=True)
+        model = AutoModel.from_pretrained(RADFINDER_REPO, revision=RADFINDER_REVISION, trust_remote_code=True)
         self.model = model.eval().requires_grad_(False).to(device)
         self.device = device
 
