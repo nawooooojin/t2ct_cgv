@@ -1,6 +1,6 @@
 # t2ct_cgv
 
-Team CGV (KAIST) code for the MICCAI 2026 VLM3D Challenge.
+Team CGV code for the MICCAI 2026 VLM3D Challenge.
 
 | Track | Hidden test result |
 |---|---|
