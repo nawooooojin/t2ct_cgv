@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.env
+data/
+logs/
+outputs/
+weights/
+work/
+pred_*/
+wandb/
+third_party/
+*.ckpt
+*.pt

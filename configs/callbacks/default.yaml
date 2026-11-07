@@ -1,0 +1,18 @@
+model_checkpoint:
+  _target_: lightning.pytorch.callbacks.ModelCheckpoint
+  dirpath: ${paths.output_dir}/checkpoints
+  filename: "epoch_{epoch:03d}"
+  monitor: null
+  save_top_k: -1
+  every_n_epochs: 10
+  save_last: true
+  auto_insert_metric_name: false
+model_summary:
+  _target_: lightning.pytorch.callbacks.ModelSummary
+  max_depth: 1
+lr_monitor:
+  _target_: lightning.pytorch.callbacks.LearningRateMonitor
+  logging_interval: step
+ema:
+  _target_: src.models.ema.EMACallback
+  decay: 0.9999

@@ -1,0 +1,13 @@
+wandb:
+  _target_: lightning.pytorch.loggers.wandb.WandbLogger
+  name: ${task_name}
+  save_dir: ${paths.output_dir}
+  offline: false
+  id: null
+  anonymous: null
+  project: "t2ct_cgv"
+  log_model: false
+  prefix: ""
+  group: ""
+  tags: []
+  job_type: ""
