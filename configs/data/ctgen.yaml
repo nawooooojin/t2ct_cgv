@@ -1,0 +1,8 @@
+_target_: src.data.datamodule.CTRateLatentDataModule
+datalist_path: ${paths.data_dir}/ctgen/datalist.json
+batch_size: 12            # per GPU; 2 GPUs -> global 24
+num_workers: 16
+spacing_multiplier: 100.0
+load_spectre: true
+pin_memory: true
+prefetch_factor: 2
