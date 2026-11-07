@@ -89,9 +89,18 @@ CFG scale 5, 100 sampling steps.
 References: MAISI (WACV 2025), Wan (arXiv:2503.20314), U-REPA (NeurIPS 2025), SPECTRE (CVPR 2026),
 RadFinder (arXiv:2603.02026).
 
+## Team
+
+Team CGV
+
+| Name | Affiliation |
+|---|---|
+| Hyunjun Park | Korea Advanced Institute of Science and Technology (KAIST) |
+| Woojin Na | Korea Advanced Institute of Science and Technology (KAIST) |
+| Jinah Park | Korea Advanced Institute of Science and Technology (KAIST) |
+
 ## Notes
 
-- Team CGV.
 - Evaluation: official VLM3D metrics (CT: FVD, FID 2.5D, CT-CLIP score; MR: SSIM, PSNR, MSE, FID 2.5D).
 - Limitations: report-only generation, so lesion location and size are not reliably reproduced; trained and tested on CT-RATE / MR-RATE only.
-- License: code under Apache-2.0 (`LICENSE`); weights under CC BY-NC-SA 4.0; pretrained models and datasets keep their own licenses.
+- License: code under CC BY-NC 4.0 (`LICENSE`); weights under CC BY-NC-SA 4.0; pretrained models and datasets keep their own licenses.
