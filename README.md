@@ -95,8 +95,8 @@ Team CGV
 
 | Name | Affiliation |
 |---|---|
-| Hyunjun Park | Korea Advanced Institute of Science and Technology (KAIST) |
 | Woojin Na | Korea Advanced Institute of Science and Technology (KAIST) |
+| Hyunjun Park | Korea Advanced Institute of Science and Technology (KAIST) |
 | Jinah Park | Korea Advanced Institute of Science and Technology (KAIST) |
 
 ## Notes
