@@ -1,23 +1,25 @@
-# WARP-CT model: rectified-flow 3D U-Net in the Wan2.1 VAE latent space (16 x 64^3),
-# RadFinder navg tokens -> cross-attention, pooled text -> AdaGN, U-REPA to SPECTRE tokens.
-_target_: src.models.module.T2CTModule
-lr: 3.0e-4
-cfg_drop_prob: 0.15        # per-sample text dropout for classifier-free guidance
-lr_scheduler_power: 2.0    # PolynomialLR after linear warmup
-warmup_steps: 1000
-repa_weight: 0.5           # L = L_velocity + 0.5 * (L_cos + 3 * L_rel)
+# WARP-CT: AdaGN U-Net on the Wan2.1 latent + REPA with a frozen SPECTRE teacher. Text conditioning uses RadFinder:
+#   local  : layer-aggregated token sequence (L, 1024) -> cross-attention (masked)
+#   global : [EOS, mean] per section (2048 x 2) -> zero-init Linear added to the time embedding
+_target_: src.models.module.LatentDiffusionModule
+lr: 2e-4
+cfg_drop_prob: 0.15
+modality_class_label: 1       # CT (MR batches carry their own class_label)
+lr_scheduler_power: 2.0
+warmup_steps: 500
 
 unet:
-  _target_: src.models.unet.ReportUNet3D
+  _target_: src.models.unet.DiffusionModelUNetMaisiTextPooledAdaGN
   spatial_dims: 3
-  in_channels: 16
+  in_channels: 16             # Wan2.1 latent channels
   out_channels: 16
   num_channels: [64, 128, 256, 512]
   num_res_blocks: 2
   attention_levels: [false, false, true, true]
   num_head_channels: [0, 0, 32, 32]
-  cross_attention_dim: 1024      # RadFinder hidden width, no projector
-  text_pooled_dim: 4096          # (EOS 1024 + masked mean 1024) x (findings, impression)
+  cross_attention_dim: 1024
+  text_pooled_dim: 4096
+  text_pooled_concat: true
   num_class_embeds: 128
   include_fc: true
   include_spacing_input: true
@@ -30,24 +32,21 @@ unet:
 noise_scheduler:
   _target_: src.models.rflow.RFlowScheduler
   num_train_timesteps: 1000
-  scale: 1.4                     # only read by the logit-normal sampler (unused with uniform)
+  scale: 1.4
   use_timestep_transform: true
   use_discrete_timesteps: false
   sample_method: uniform
 
 repa:
   _target_: src.models.repa.RepaAligner
-  student_channels: 512          # middle_block output (B, 512, 8, 8, 8)
-  teacher_dim: 1080              # SPECTRE ViT-L token width
-  student_grid: [8, 8, 8]
+  student_channels: 512       # middle_block channels
+  teacher_dim: 1080           # SPECTRE ViT-L
   teacher_grid: [16, 16, 16]
-  crop_tokens: [4, 4, 4]
-  projector: mlp
-  upsample: trilinear
+  student_grid: [8, 8, 8]
   spatial_norm_teacher: true
   gamma: 1.0
-  hard_weight: 1.0
-  rel_weight: 3.0
-  rel_loss: urepa_l2
-  rel_scope: global
-  global_weight: 0.0
+  hard_weight: 1.0            # L_REPA (token-wise cosine)
+  rel_weight: 3.0             # w, L_ML (pairwise similarity)
+  rel_tokens: null            # all 4096 teacher tokens
+repa_weight: 0.5              # lambda
+repa_tap: middle_block

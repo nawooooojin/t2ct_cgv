@@ -1,139 +1,101 @@
-"""CT-RATE Wan-latent datamodule: latent + RadFinder navg sidecar + SPECTRE teacher tokens."""
+"""Training data: precomputed Wan latents, SPECTRE teacher tokens and RadFinder text features.
+
+Datalist (``scripts/preprocess/build_datalist.py``): ``{"training": [...], "validation": [...]}``,
+each entry ``{"image": <id>_emb.nii.gz, "spectre": <id>.npy, "text": <id>_rf_navg.npz,
+"cond": <id>_cond.json}`` plus, for WARP-MR, ``"class_label"``.
+
+Batch keys
+    image              (B, 16, 64, 64, 64)  Wan latent
+    spacing            (B, 3)               resampled voxel spacing (mm) x `spacing_multiplier`
+    spectre            (B, 4096, 1080)      teacher tokens (16^3 grid)
+    context_{f,i}_seq  (B, T, 1024)         RadFinder token sequence, right-padded
+    context_{f,i}_mask (B, T)               True = real token
+    context_{f,i}      (B, 2048)            global vector (computed before padding)
+    class_label        (B,)                 (sequence, plane) class, WARP-MR only
+"""
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
-import nibabel as nib
 import numpy as np
 import torch
-from lightning import LightningDataModule
-from torch.utils.data import DataLoader, Dataset
+from lightning.pytorch import LightningDataModule
+from monai.data import DataLoader, Dataset
+from monai.data.utils import list_data_collate
+from monai.transforms import Compose, EnsureChannelFirstd, LoadImaged
 
-from src.data.rf_navg import load_text_sidecar, pad_sequences
+from src.data.rf_navg import global_vector, pad_sequences
+
+_SECTIONS = {"f": "findings", "i": "impression"}
 
 
-class CTRateLatentDataset(Dataset):
-    """One datalist split (§ datalist.json entries) as per-sample tensors.
+class _LoadFeatures:
+    """Replaces the `cond` / `spectre` / `text` paths of an entry with tensors."""
 
-    Args:
-        entries: dicts with ``id``, ``image``, ``text``, ``spectre``, ``spacing`` (mm, ``[3]``).
-        spacing_multiplier: factor applied to the spacing fed to the UNet.
-        load_spectre: also load the ``(4096, 1080)`` SPECTRE tokens for REPA.
-    """
-
-    def __init__(
-        self, entries: list[dict], spacing_multiplier: float = 100.0, load_spectre: bool = True
-    ) -> None:
-        self.entries = entries
+    def __init__(self, spacing_multiplier: float) -> None:
         self.spacing_multiplier = spacing_multiplier
-        self.load_spectre = load_spectre
 
-    def __len__(self) -> int:
-        return len(self.entries)
-
-    def __getitem__(self, i: int) -> dict[str, Any]:
-        """Load one sample.
-
-        Returns:
-            ``id``; ``image`` ``(16, 64, 64, 64)`` (C, H, W, D); ``spacing`` ``(3,)`` (mm x multiplier);
-            ``seq_f`` ``(L_f, 1024)``; ``seq_i`` ``(L_i, 1024)``; ``pooled_f``/``pooled_i`` ``(2048,)``;
-            ``spectre`` ``(4096, 1080)`` if ``load_spectre``. All float32.
-        """
-        e = self.entries[i]
-        arr = np.asarray(nib.load(e["image"]).dataobj, dtype=np.float32)  # (64, 64, 64, 16) HWDC
-        sample: dict[str, Any] = {
-            "id": e["id"],
-            "image": torch.from_numpy(np.ascontiguousarray(np.moveaxis(arr, -1, 0))),  # (16, 64, 64, 64)
-            "spacing": torch.tensor(e["spacing"], dtype=torch.float32) * self.spacing_multiplier,  # (3,)
-            **load_text_sidecar(e["text"]),
-        }
-        if self.load_spectre:
-            sample["spectre"] = torch.from_numpy(np.load(e["spectre"])).float()  # (4096, 1080)
-        return sample
+    def __call__(self, data: dict[str, Any]) -> dict[str, Any]:
+        data = dict(data)
+        cond = json.loads(Path(data.pop("cond")).read_text())
+        data["spacing"] = torch.tensor(cond["spacing"], dtype=torch.float32) * self.spacing_multiplier
+        data["spectre"] = torch.from_numpy(np.load(data["spectre"])).float()
+        npz = np.load(data.pop("text"))
+        for short, section in _SECTIONS.items():
+            seq = torch.from_numpy(npz[f"{section}_rf_navg"].astype(np.float32))  # (L, 1024)
+            eos = torch.from_numpy(npz[f"{section}_rf_last"].astype(np.float32))  # (1024,)
+            data[f"context_{short}_seq"] = seq
+            data[f"context_{short}"] = global_vector(eos, seq, torch.ones(len(seq), dtype=torch.bool))
+        return data
 
 
 def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    """Stack fixed-size fields; pad each text section to its own batch max, then concat findings | impression.
-
-    Returns:
-        ``id`` list; ``image`` ``(B, 16, 64, 64, 64)``; ``spacing`` ``(B, 3)``;
-        ``context`` ``(B, T_f + T_i, 1024)``; ``context_mask`` ``(B, T_f + T_i)`` bool;
-        ``pooled_f``/``pooled_i`` ``(B, 2048)``; ``spectre`` ``(B, 4096, 1080)`` when present.
-    """
-    seq_f, mask_f = pad_sequences([b["seq_f"] for b in batch])  # (B, T_f, 1024), (B, T_f)
-    seq_i, mask_i = pad_sequences([b["seq_i"] for b in batch])  # (B, T_i, 1024), (B, T_i)
-    out: dict[str, Any] = {
-        "id": [b["id"] for b in batch],
-        "image": torch.stack([b["image"] for b in batch]),  # (B, 16, 64, 64, 64)
-        "spacing": torch.stack([b["spacing"] for b in batch]),  # (B, 3)
-        "context": torch.cat([seq_f, seq_i], dim=1),  # (B, T_f + T_i, 1024)
-        "context_mask": torch.cat([mask_f, mask_i], dim=1),  # (B, T_f + T_i)
-        "pooled_f": torch.stack([b["pooled_f"] for b in batch]),  # (B, 2048)
-        "pooled_i": torch.stack([b["pooled_i"] for b in batch]),  # (B, 2048)
-    }
-    if "spectre" in batch[0]:
-        out["spectre"] = torch.stack([b["spectre"] for b in batch])  # (B, 4096, 1080)
+    """Pads the ragged text sequences and builds their masks; everything else is stacked."""
+    rest = [dict(b) for b in batch]
+    seqs = {k: [b.pop(k) for b in rest] for k in ("context_f_seq", "context_i_seq")}
+    out = list_data_collate(rest)
+    for key, s in seqs.items():
+        out[key], out[key.replace("_seq", "_mask")] = pad_sequences(s)
     return out
 
 
-class CTRateLatentDataModule(LightningDataModule):
-    """Lightning datamodule over ``datalist.json`` (``training`` / ``validation`` lists).
-
-    Args:
-        datalist_path: path of the datalist written by ``scripts/preprocess/build_datalist.py``.
-        batch_size: per-GPU batch size.
-        num_workers: DataLoader workers.
-        spacing_multiplier: factor applied to the voxel spacing (mm) fed to the UNet.
-        load_spectre: load SPECTRE tokens (needed for the REPA loss).
-        pin_memory: DataLoader ``pin_memory``.
-        prefetch_factor: DataLoader ``prefetch_factor`` (ignored when ``num_workers == 0``).
-    """
-
+class VolumeDataModule(LightningDataModule):
     def __init__(
         self,
         datalist_path: str,
-        batch_size: int = 12,
-        num_workers: int = 16,
+        batch_size: int = 2,
+        num_workers: int = 8,
         spacing_multiplier: float = 100.0,
-        load_spectre: bool = True,
         pin_memory: bool = True,
-        prefetch_factor: int = 2,
     ) -> None:
         super().__init__()
-        self.save_hyperparameters()
-        self.train_ds: CTRateLatentDataset | None = None
-        self.val_ds: CTRateLatentDataset | None = None
+        self.datalist_path = Path(datalist_path)
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.spacing_multiplier = spacing_multiplier
+        self.pin_memory = pin_memory
+        self.train_ds: Dataset | None = None
+        self.val_ds: Dataset | None = None
 
     def setup(self, stage: str | None = None) -> None:
-        """Read the datalist and build both datasets (once)."""
-        if self.train_ds is not None:
-            return
-        hp = self.hparams
-        with open(hp.datalist_path) as f:
-            datalist = json.load(f)
-        self.train_ds = CTRateLatentDataset(datalist["training"], hp.spacing_multiplier, hp.load_spectre)
-        self.val_ds = CTRateLatentDataset(datalist["validation"], hp.spacing_multiplier, hp.load_spectre)
+        datalist = json.loads(self.datalist_path.read_text())
+        transform = Compose([
+            LoadImaged(keys="image"),
+            EnsureChannelFirstd(keys="image"),  # (64, 64, 64, 16) -> (16, 64, 64, 64)
+            _LoadFeatures(self.spacing_multiplier),
+        ])
+        self.train_ds = Dataset(datalist["training"], transform=transform)
+        self.val_ds = Dataset(datalist["validation"], transform=transform)
 
     def _loader(self, ds: Dataset, shuffle: bool) -> DataLoader:
-        hp = self.hparams
-        return DataLoader(
-            ds,
-            batch_size=hp.batch_size,
-            shuffle=shuffle,
-            num_workers=hp.num_workers,
-            pin_memory=hp.pin_memory,
-            prefetch_factor=hp.prefetch_factor if hp.num_workers > 0 else None,
-            collate_fn=collate,
-        )
+        return DataLoader(ds, batch_size=self.batch_size, shuffle=shuffle, num_workers=self.num_workers,
+                          pin_memory=self.pin_memory, collate_fn=collate)
 
     def train_dataloader(self) -> DataLoader:
-        """Shuffled loader over the training split."""
-        self.setup("fit")
         return self._loader(self.train_ds, shuffle=True)
 
     def val_dataloader(self) -> DataLoader:
-        """Unshuffled loader over the validation split."""
-        self.setup("validate")
         return self._loader(self.val_ds, shuffle=False)

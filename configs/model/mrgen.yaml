@@ -1,0 +1,3 @@
+# WARP-MR: the WARP-CT model unchanged; the (sequence, plane) class label comes from the batch.
+defaults:
+  - ctgen

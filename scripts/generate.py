@@ -1,174 +1,196 @@
-"""Generate CT volumes from challenge prompts with a trained WARP-CT checkpoint.
+"""Generate volumes from reports (challenge format).
 
-Per prompt: RadFinder sidecar (``encode_text_ctgen.py --prompts``) -> CFG rectified-flow sampling
-in the Wan latent space ``(1, 16, 64, 64, 64)`` -> Wan VAE decode ``(253, 512, 512)`` HU ->
-float32 ``.nii.gz`` of 512 x 512 x 253 at the given spacing. The decoded content is RAS; the two
-in-plane axes are flipped to LPS content (CT-RATE convention), direction left at identity.
+Input : prompts JSON, ``[{"input_image_name": ..., "report": ...}, ...]``
+Output: ``<out-dir>/<input_image_name stem>.nii.gz`` (float32), one per prompt
+
+The prompts are encoded with RadFinder first (encode_text_ctgen.py / encode_text_mrgen.py --prompts).
+WARP-CT:
+    python scripts/generate.py --task ctgen --ckpt weights/warp_ct_ema.ckpt \
+        --prompts prompts.json --text-dir work/text --out-dir outputs/ctgen_pred
+WARP-MR:
+    python scripts/generate.py --task mrgen --ckpt weights/warp_mr_ema.ckpt \
+        --prompts prompts.json --text-dir work/text --out-dir outputs/mrgen_pred \
+        --spacing-table weights/spacing_table.json --axcodes-table weights/axcodes_table.json
+
+Sampling: rectified flow, 100 Euler steps, classifier-free guidance 5 (unconditional branch = zeroed
+text). CT volumes are 512 x 512 x 253 HU at spacing 0.75 / 0.75 / 1.3 mm; MR volumes are [0, 1] with
+the median spacing of their (sequence, plane) class.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-import logging
+import sys
 from pathlib import Path
 
+import nibabel as nib
+import numpy as np
 import rootutils
+import SimpleITK as sitk
+import torch
+from tqdm import tqdm
 
-ROOT = rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
+rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
-import hydra  # noqa: E402
-import numpy as np  # noqa: E402
-import SimpleITK as sitk  # noqa: E402
-import torch  # noqa: E402
-from omegaconf import OmegaConf  # noqa: E402
-from tqdm import tqdm  # noqa: E402
+from src.data import mr_rate  # noqa: E402
+from src.data.rf_navg import global_vector  # noqa: E402
+from src.encoders.wan_vae import WanVAE  # noqa: E402
+from src.models.rflow import RFlowScheduler  # noqa: E402
+from src.models.unet import build_unet  # noqa: E402
 
-from src.data.ct_rate import prompt_stem  # noqa: E402
-from src.data.rf_navg import load_text_sidecar  # noqa: E402
-from src.encoders.wan_vae import DEFAULT_WAN_HF_ID, WanVAE  # noqa: E402
-from src.models.module import MODALITY_CLASS_CT  # noqa: E402
-
-log = logging.getLogger("generate")
-LATENT_SHAPE = (16, 64, 64, 64)  # (C, H, W, D)
+LATENT_SHAPE = (16, 64, 64, 64)  # U-Net layout (C, H, W, D)
 SPACING_MULTIPLIER = 100.0
+CT_CLASS_LABEL = 1
 
 
-def load_unet(ckpt_path: str, device: torch.device) -> tuple[torch.nn.Module, object, float]:
-    """Build the UNet + scheduler from ``configs/model/ctgen.yaml`` and load the checkpoint.
+def noise_seed(stem: str, seed: int) -> int:
+    """Per-case seed: the same (case, seed) pair always starts from the same noise."""
+    return int.from_bytes(hashlib.sha256(f"{stem}|{seed}".encode()).digest()[:8], "big")
 
-    The EMA shadow is overlaid on the raw weights when the checkpoint carries one (a file from
-    ``extract_ema.py`` already holds EMA weights in ``state_dict``).
 
-    Returns:
-        ``(unet, scheduler, scale_factor)``.
-    """
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    sd = dict(ckpt["state_dict"])
-    shadow = ckpt.get("callbacks", {}).get("EMACallback", {}).get("shadow")
-    if shadow:
-        sd.update(shadow)
-        log.info("EMA shadow overlaid (%d tensors)", len(shadow))
-    scale_factor = float(sd["scale_factor"])
-    log.info("scale_factor %.6f", scale_factor)
+def case_stem(name: str) -> str:
+    return name[: -len(".nii.gz")] if name.endswith(".nii.gz") else Path(name).stem
 
-    cfg = OmegaConf.load(Path(ROOT) / "configs" / "model" / "ctgen.yaml")
-    cfg.unet.use_flash_attention = False
-    unet = hydra.utils.instantiate(cfg.unet)
-    unet.load_state_dict({k[len("unet.") :]: v for k, v in sd.items() if k.startswith("unet.")}, strict=True)
-    unet = unet.to(device).eval().requires_grad_(False)
-    scheduler = hydra.utils.instantiate(cfg.noise_scheduler)
-    return unet, scheduler, scale_factor
+
+def class_table_entry(table: dict, label: int, stem: str):
+    """``table[label]``; a class missing from the table (never seen in training, e.g. swi-sag) falls
+    back to the same sequence's axial class, any plane of that sequence, t2w-axi, then the first entry."""
+    if label in table:
+        return table[label]
+    if not table:
+        raise ValueError(f"empty lookup table (first case: {stem})")
+    mod, _ = list(mr_rate.CLASS_LABELS)[label]
+    candidates = [mr_rate.CLASS_LABELS[(mod, p)] for p in ("axi", *mr_rate.PLANES)]
+    candidates += [mr_rate.CLASS_LABELS[("t2w", "axi")], next(iter(table))]
+    used = next(c for c in candidates if c in table)
+    print(f"{stem}: class {label} is not in the table, using class {used}", file=sys.stderr)
+    return table[used]
+
+
+def load_unet(ckpt_path: str, device: torch.device):
+    sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)["state_dict"]
+    unet_sd = {k[len("unet."):]: v for k, v in sd.items() if k.startswith("unet.")}
+    xattn_dim = next(v.shape[1] for k, v in unet_sd.items() if k.endswith("attn2.to_k.weight"))
+    unet = build_unet(cross_attention_dim=xattn_dim, text_pooled_dim=unet_sd["text_pooled_proj.weight"].shape[1])
+    unet.load_state_dict(unet_sd, strict=True)
+    return unet.to(device).eval().requires_grad_(False), float(sd["scale_factor"])
 
 
 @torch.no_grad()
-def sample_latent(
-    unet: torch.nn.Module,
-    scheduler: object,
-    sidecar: dict[str, torch.Tensor],
-    spacing_mm: list[float],
-    cfg_scale: float,
-    steps: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """CFG rectified-flow sampling for one prompt.
+def denoise(unet, scale_factor, cond: dict, class_label: int, spacing_mm, n_steps: int, cfg: float,
+            device: torch.device) -> torch.Tensor:
+    """Rectified-flow sampling with classifier-free guidance -> latent ``(16, 64, 64, 64)`` (Wan layout)."""
+    sched = RFlowScheduler(num_train_timesteps=1000, scale=1.4, use_timestep_transform=True,
+                           use_discrete_timesteps=False, sample_method="uniform")
+    sched.set_timesteps(n_steps, device=device, input_img_size=torch.tensor(float(64 ** 3)))
+    ts = sched.timesteps
+    next_ts = torch.cat([ts[1:], torch.zeros(1, dtype=ts.dtype, device=ts.device)])
 
-    The unconditional branch zeroes the context and both pooled vectors (mask unchanged), as the
-    training-time CFG dropout does.
+    z = torch.randn(1, *LATENT_SHAPE, device=device)
+    labels = torch.tensor([class_label, class_label], device=device)
+    spacing = (torch.tensor(spacing_mm, dtype=torch.float32) * SPACING_MULTIPLIER).to(device)[None].repeat(2, 1)
+    # batch the unconditional (zeroed text) and conditional branches together
+    kw = {k: torch.cat([torch.zeros_like(v), v]) for k, v in cond.items() if k != "context_mask"}
+    kw["context_mask"] = cond["context_mask"].repeat(2, 1)
 
-    Returns:
-        Latent ``(1, 16, 64, 64, 64)`` = (B, C, H, W, D), still multiplied by ``scale_factor``.
-    """
-    ctx = torch.cat([sidecar["seq_f"], sidecar["seq_i"]], 0)[None].to(device)  # (1, L_f + L_i, 1024)
-    mask = torch.ones(ctx.shape[:2], dtype=torch.bool, device=device)  # (1, L_f + L_i)
-    pf = sidecar["pooled_f"][None].to(device)  # (1, 2048)
-    pi = sidecar["pooled_i"][None].to(device)  # (1, 2048)
-    spacing = (torch.tensor(spacing_mm, dtype=torch.float32) * SPACING_MULTIPLIER)[None].to(device)  # (1, 3)
-    cls = torch.tensor([MODALITY_CLASS_CT], device=device)  # (1,)
-
-    scheduler.set_timesteps(steps, device=device, input_img_size=torch.tensor(float(64 * 64 * 64)))
-    all_t = scheduler.timesteps
-    all_next_t = torch.cat((all_t[1:], torch.tensor([0], dtype=all_t.dtype, device=all_t.device)))
-    z = torch.randn(1, *LATENT_SHAPE, device=device, dtype=torch.float32)  # (1, 16, 64, 64, 64)
-
-    use_cfg = cfg_scale != 1.0
-    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-        for t, next_t in zip(all_t, all_next_t):
-            t_s, next_s = float(t.item()), float(next_t.item())
-            t_tensor = torch.tensor([t_s], device=device, dtype=torch.float32)  # (1,)
-            if use_cfg:
-                pred = unet(
-                    x=torch.cat([z, z]),  # (2, 16, 64, 64, 64)
-                    timesteps=t_tensor.repeat(2),
-                    context=torch.cat([torch.zeros_like(ctx), ctx]),  # (2, L, 1024) [uncond, cond]
-                    class_labels=cls.repeat(2),
-                    spacing_tensor=spacing.repeat(2, 1),
-                    context_mask=mask.repeat(2, 1),
-                    text_pooled_f=torch.cat([torch.zeros_like(pf), pf]),
-                    text_pooled_i=torch.cat([torch.zeros_like(pi), pi]),
-                )
-                u, c = pred.chunk(2)
-                v = u + cfg_scale * (c - u)
-            else:
-                v = unet(
-                    x=z, timesteps=t_tensor, context=ctx, class_labels=cls, spacing_tensor=spacing,
-                    context_mask=mask, text_pooled_f=pf, text_pooled_i=pi,
-                )
-            z, _ = scheduler.step(v, t_s, z, next_s)
-    return z
+    for t, t_next in zip(ts, next_ts):
+        t, t_next = float(t), float(t_next)
+        pred = unet(x=torch.cat([z, z]), timesteps=torch.tensor([t, t], device=device),
+                    spacing_tensor=spacing, class_labels=labels, **kw)
+        uncond, cond_pred = pred.chunk(2)
+        z = sched.step(uncond + cfg * (cond_pred - uncond), t, z, t_next)[0]
+    z = z / scale_factor
+    return z.squeeze(0).permute(0, 3, 1, 2).contiguous().float()  # (C, H, W, D) -> (C, T, H, W)
 
 
-def save_nifti(vol_zxy: np.ndarray, spacing_mm: list[float], out_path: Path) -> None:
-    """Save a decoded ``(Z, X, Y)`` RAS HU volume as float32 with LPS content (X, Y reversed)."""
-    arr = vol_zxy.transpose(0, 2, 1)  # (Z, Y, X) for SimpleITK
-    arr = arr[:, ::-1, ::-1].copy()  # RAS content -> LPS content
-    img = sitk.GetImageFromArray(arr.astype(np.float32))
+def save_ct(hu_zxy: np.ndarray, spacing_mm, out_path: Path) -> None:
+    """Decoded (Z, X, Y) RAS volume -> LPS array as in CT-RATE, integer HU stored as float32."""
+    arr = np.ascontiguousarray(hu_zxy.transpose(0, 2, 1))[:, ::-1, ::-1]  # (Z, Y, X), RAS -> LPS
+    img = sitk.GetImageFromArray(np.ascontiguousarray(arr).astype(np.int16).astype(np.float32))
     img.SetSpacing([float(s) for s in spacing_mm])
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     sitk.WriteImage(img, str(out_path))
 
 
+def save_mr(vol_zxy: np.ndarray, spacing_mm, axcodes, out_path: Path) -> None:
+    """Decoded (Z, X, Y) RAS volume in [-1, 1] -> [0, 1] array reoriented to `axcodes`.
+
+    The scorer reads the raw array, so the array itself is permuted/flipped; `as_reoriented` keeps
+    the affine (spacing order, signs, origin) consistent with it.
+    """
+    vol = np.clip((vol_zxy.transpose(1, 2, 0).astype(np.float32) + 1.0) / 2.0, 0.0, 1.0)  # (X, Y, Z)
+    ornt = nib.orientations.ornt_transform(nib.orientations.axcodes2ornt(("R", "A", "S")),
+                                           nib.orientations.axcodes2ornt(tuple(axcodes)))
+    img = nib.Nifti1Image(vol, np.diag([spacing_mm[0], spacing_mm[1], spacing_mm[2], 1.0])).as_reoriented(ornt)
+    nib.save(img, str(out_path))
+
+
 def main() -> None:
-    """Generate one volume per prompt (existing outputs are skipped)."""
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--task", choices=("ctgen",), default="ctgen")
-    p.add_argument("--ckpt", required=True)
-    p.add_argument("--prompts", required=True, help='prompts.json [{"input_image_name", "report"}]')
-    p.add_argument("--text-dir", required=True, help="sidecars from encode_text_ctgen.py --prompts")
-    p.add_argument("--out-dir", required=True)
-    p.add_argument("--cfg-scale", type=float, default=5.0)
-    p.add_argument("--steps", type=int, default=100)
-    p.add_argument("--spacing", type=float, nargs=3, default=[0.75, 0.75, 1.3], help="mm (x, y, z)")
-    p.add_argument("--seed", type=int, default=None)
-    p.add_argument("--device", default="cuda")
-    p.add_argument("--hf-id", default=DEFAULT_WAN_HF_ID, help="Wan VAE Hugging Face repo")
-    args = p.parse_args()
-    logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--task", choices=["ctgen", "mrgen"], required=True)
+    ap.add_argument("--ckpt", required=True, help="EMA weights (scripts/extract_ema.py)")
+    ap.add_argument("--prompts", required=True)
+    ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--steps", type=int, default=100)
+    ap.add_argument("--cfg", type=float, default=5.0)
+    ap.add_argument("--seed", type=int, default=None, help="fix the initial noise of every case")
+    ap.add_argument("--save-latents", action="store_true", help="also save <stem>.npy latents (16, 64, 64, 64)")
+    ap.add_argument("--text-dir", required=True, help="RadFinder features of the prompts")
+    ap.add_argument("--spacing", type=float, nargs=3, default=[0.75, 0.75, 1.3], help="ctgen output spacing (mm)")
+    ap.add_argument("--spacing-table", help="mrgen: spacing_table.json")
+    ap.add_argument("--axcodes-table", help="mrgen: axcodes_table.json")
+    ap.add_argument("--device", default="cuda:0")
+    args = ap.parse_args()
 
     device = torch.device(args.device)
-    if args.seed is not None:
-        torch.manual_seed(args.seed)
-    if device.type == "cuda":
-        torch.backends.cuda.enable_flash_sdp(False)
-        torch.backends.cuda.enable_mem_efficient_sdp(True)
-    unet, scheduler, scale_factor = load_unet(args.ckpt, device)
-    vae = WanVAE(hf_id=args.hf_id, device=args.device)
-
-    prompts = json.loads(Path(args.prompts).read_text())
+    torch.backends.cuda.enable_flash_sdp(False)
     out_dir = Path(args.out_dir)
-    text_dir = Path(args.text_dir)
-    for item in tqdm(prompts, desc="generate"):
-        name = item["input_image_name"]
-        out_path = out_dir / name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    prompts = json.loads(Path(args.prompts).read_text())
+
+    unet, scale_factor = load_unet(args.ckpt, device)
+    if args.task == "mrgen":
+        spacing_table = {int(k): v for k, v in json.loads(Path(args.spacing_table).read_text()).items()}
+        axcodes_table = {int(k): v for k, v in json.loads(Path(args.axcodes_table).read_text()).items()}
+    vae = WanVAE(device=args.device)
+
+    for e in tqdm(prompts, desc="generate"):
+        stem = case_stem(str(e["input_image_name"]))
+        out_path = out_dir / f"{stem}.nii.gz"
         if out_path.exists():
             continue
-        sidecar = load_text_sidecar(text_dir / f"{prompt_stem(name)}.npz")
-        z = sample_latent(unet, scheduler, sidecar, args.spacing, args.cfg_scale, args.steps, device)
-        z = (z / scale_factor).float()  # (1, 16, 64, 64, 64) = (B, C, H, W, D)
-        z_wan = z[0].permute(0, 3, 1, 2).contiguous()  # (16, 64, 64, 64) = (C, T_lat=D, H, W)
-        vol = vae.decode(z_wan)  # (253, 512, 512) = (Z, X, Y), HU
-        save_nifti(vol.numpy(), args.spacing, out_path)
-        log.info("saved %s", out_path)
+        if args.task == "ctgen":
+            label, spacing = CT_CLASS_LABEL, list(args.spacing)
+        else:
+            try:
+                label = mr_rate.class_label(stem)
+            except ValueError:  # unscored sequence (e.g. dwi) or unparseable name: not scored, skipped
+                print(f"skip {stem}: not a scored MR (sequence, plane)", file=sys.stderr)
+                continue
+            spacing = class_table_entry(spacing_table, label, stem)
+        npz = np.load(Path(args.text_dir) / f"{stem}_rf_navg.npz")
+        seqs, pooled = [], {}
+        for short, section in (("f", "findings"), ("i", "impression")):
+            seq = torch.from_numpy(npz[f"{section}_rf_navg"].astype(np.float32))  # (L, 1024)
+            eos = torch.from_numpy(npz[f"{section}_rf_last"].astype(np.float32))  # (1024,)
+            pooled[f"text_pooled_{short}"] = global_vector(eos, seq, torch.ones(len(seq), dtype=torch.bool))[None]
+            seqs.append(seq)
+        context = torch.cat(seqs)[None]  # (1, L_f + L_i, 1024)
+        cond = {"context": context, "context_mask": torch.ones(context.shape[:2], dtype=torch.bool), **pooled}
+        cond = {k: v.to(device) for k, v in cond.items()}
+
+        if args.seed is not None:
+            torch.manual_seed(noise_seed(stem, args.seed))
+        with torch.autocast(device.type, dtype=torch.bfloat16):
+            z = denoise(unet, scale_factor, cond, label, spacing, args.steps, args.cfg, device)
+        if args.save_latents:
+            np.save(out_dir / f"{stem}.npy", z.cpu().numpy())
+        vol = vae.decode(z, intensity="hu" if args.task == "ctgen" else "unit").numpy()  # (Z, X, Y)
+        if args.task == "ctgen":
+            save_ct(vol, spacing, out_path)
+        else:
+            save_mr(vol, spacing, class_table_entry(axcodes_table, label, stem), out_path)
 
 
 if __name__ == "__main__":

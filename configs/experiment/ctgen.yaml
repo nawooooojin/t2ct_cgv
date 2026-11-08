@@ -1,26 +1,21 @@
 # @package _global_
-# WARP-CT: batch 24 (2 GPUs x 12), Adam lr 3e-4, warmup 1000, bf16 mixed, grad clip 5, EMA 0.9999, 150 epochs.
+# WARP-CT submission model: full CT-RATE train set, 2 GPUs x batch 12, 150 epochs.
+# The submitted weights are the EMA after the last epoch (checkpoints/last.ckpt).
 defaults:
   - override /data: ctgen
   - override /model: ctgen
-  - override /trainer: default
-  - override /callbacks: default
-  - _self_
 
 task_name: ctgen
-tags: ["ctgen", "wan_latent", "navg", "adagn", "repa"]
-seed: 42
 
 data:
   batch_size: 12
-  num_workers: 16
 
 model:
-  lr: 3.0e-4
+  lr: 3e-4
   warmup_steps: 1000
 
 trainer:
-  max_epochs: 150
   devices: 2
   strategy: ddp
   gradient_clip_val: 5.0
+  max_epochs: 150

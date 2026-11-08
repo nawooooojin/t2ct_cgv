@@ -1,13 +1,12 @@
-"""Encode reports to RadFinder text sidecars ``<out-dir>/<id>.npz`` (run in the t2ct-radfinder env).
+"""WARP-CT text features with RadFinder (run in the RadFinder environment, transformers >= 5).
 
-Sidecar = four float16 arrays: ``{findings,impression}_rf_navg`` ``(L, 1024)`` (29-layer
-RMS-normalise-then-mean tokens, real length, EOS last) and ``{findings,impression}_rf_last``
-``(1024,)`` (final-layer EOS, RMS-normalised). A blank section is encoded as ``""`` (L = 1).
+Writes ``<out-dir>/<id>_rf_navg.npz`` in the same format as encode_text_mrgen.py.
 
-Two inputs:
-  --ids IDS --reports-csv CSV   training data; volumes of one scan share one report (encoded once)
-  --prompts prompts.json        challenge prompts [{"input_image_name", "report"}]; the report is
-                                split into findings / impression, output named by the image stem
+Training data, from the CT-RATE report CSV (columns VolumeName, Findings_EN, Impressions_EN):
+    python scripts/preprocess/encode_text_ctgen.py --ids ids/ctrate_train.txt \
+        --reports-csv /path/CT-RATE/dataset/radiology_text_reports/train_reports.csv --out-dir data/ctgen/text
+Challenge prompts (``[{"input_image_name", "report"}]``, split with `ct_rate.split_report`):
+    python scripts/preprocess/encode_text_ctgen.py --prompts /input/prompts.json --out-dir work/text
 """
 
 from __future__ import annotations
@@ -17,89 +16,51 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root (no rootutils in this env)
+import pandas as pd
+import rootutils
+from tqdm import tqdm
 
-import numpy as np  # noqa: E402
-from tqdm import tqdm  # noqa: E402
+rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
-from scripts.preprocess.common import save_npz_atomic  # noqa: E402
-from src.data.ct_rate import load_reports, prompt_stem, read_ids, scan_key, split_report  # noqa: E402
+from src.data import ct_rate  # noqa: E402
 from src.encoders.radfinder import RadFinderTextEncoder  # noqa: E402
-
-
-def encode_report(rf: RadFinderTextEncoder, findings: str, impression: str) -> dict[str, np.ndarray]:
-    """Both sections of one report -> the four sidecar arrays (float16)."""
-    out: dict[str, np.ndarray] = {}
-    for section, text in (("findings", findings), ("impression", impression)):
-        navg, last = rf.encode_navg(text)  # (L, 1024), (1024,) float32
-        out[f"{section}_rf_navg"] = navg.numpy().astype(np.float16)
-        out[f"{section}_rf_last"] = last.numpy().astype(np.float16)
-    return out
-
-
-def jobs_from_ids(args: argparse.Namespace) -> list[tuple[str, str, str, list[Path]]]:
-    """``(key, findings, impression, out_paths)`` per distinct scan of ``--ids``."""
-    reports = load_reports(args.reports_csv)
-    out_dir = Path(args.out_dir)
-    by_scan: dict[str, list[Path]] = {}
-    for vol_id in read_ids(args.ids):
-        by_scan.setdefault(scan_key(vol_id), []).append(out_dir / f"{vol_id}.npz")
-    jobs = []
-    for key, paths in by_scan.items():
-        if key not in reports:
-            print(f"[warn] no report row for {key}; skipped {len(paths)} volume(s)", file=sys.stderr)
-            continue
-        findings, impression = reports[key]
-        jobs.append((key, findings, impression, paths))
-    return jobs
-
-
-def jobs_from_prompts(args: argparse.Namespace) -> list[tuple[str, str, str, list[Path]]]:
-    """``(name, findings, impression, [out_path])`` per challenge prompt."""
-    prompts = json.loads(Path(args.prompts).read_text())
-    out_dir = Path(args.out_dir)
-    jobs = []
-    for item in prompts:
-        name = item["input_image_name"]
-        findings, impression = split_report(item["report"])
-        jobs.append((name, findings, impression, [out_dir / f"{prompt_stem(name)}.npz"]))
-    return jobs
+from scripts.preprocess.common import read_ids  # noqa: E402
+from scripts.preprocess.encode_text_mrgen import case_stem, encode_sections, save  # noqa: E402
 
 
 def main() -> None:
-    """Encode every job whose sidecars are not all written yet."""
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    inp = p.add_mutually_exclusive_group(required=True)
-    inp.add_argument("--ids", help="volume id list (.txt or .json); needs --reports-csv")
-    inp.add_argument("--prompts", help="challenge prompts.json")
-    p.add_argument("--reports-csv", help="CT-RATE report CSV (VolumeName, Findings_EN, Impressions_EN)")
-    p.add_argument("--out-dir", required=True)
-    p.add_argument("--device", default="cuda")
-    p.add_argument("--limit", type=int, default=None, help="encode at most N reports (quick test)")
-    args = p.parse_args()
-    if args.ids and not args.reports_csv:
-        p.error("--ids needs --reports-csv")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ids", help="volume ids (training data)")
+    ap.add_argument("--reports-csv", help="CT-RATE reports CSV")
+    ap.add_argument("--prompts", help="challenge prompts JSON")
+    ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--device", default="cuda:0")
+    args = ap.parse_args()
+    if not args.prompts and not (args.ids and args.reports_csv):
+        ap.error("give --prompts, or --ids and --reports-csv")
 
-    jobs = jobs_from_ids(args) if args.ids else jobs_from_prompts(args)
-    if args.limit is not None:
-        jobs = jobs[: args.limit]
-    Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     rf = RadFinderTextEncoder(device=args.device)
 
-    done = skipped = 0
-    for key, findings, impression, paths in tqdm(jobs, desc="radfinder"):
-        if all(path.is_file() for path in paths):
-            skipped += 1
+    if args.prompts:
+        for e in tqdm(json.loads(Path(args.prompts).read_text()), desc="prompts"):
+            arrays = encode_sections(rf, *ct_rate.split_report(str(e["report"])))
+            save(out_dir / f"{case_stem(str(e['input_image_name']))}_rf_navg.npz", arrays)
+        return
+
+    df = pd.read_csv(args.reports_csv)
+    df.index = df["VolumeName"].str.replace(".nii.gz", "", regex=False)
+    for vol_id in tqdm(read_ids(args.ids), desc="text"):
+        out = out_dir / f"{vol_id}_rf_navg.npz"
+        if out.exists():
             continue
-        for section, text in (("findings", findings), ("impression", impression)):
-            if not text:
-                print(f"[blank] {section} of {key} -> encoded as ''", file=sys.stderr)
-        arrays = encode_report(rf, findings, impression)
-        for path in paths:
-            if not path.is_file():
-                save_npz_atomic(path, arrays)
-        done += 1
-    print(f"done={done} skipped={skipped} -> {args.out_dir}")
+        if vol_id not in df.index:
+            print(f"missing report: {vol_id}", file=sys.stderr)
+            continue
+        row = df.loc[vol_id]
+        # str() as for the released model: a blank cell is encoded as the text "nan"
+        save(out, encode_sections(rf, str(row["Findings_EN"]), str(row["Impressions_EN"])))
 
 
 if __name__ == "__main__":

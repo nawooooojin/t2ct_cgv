@@ -1,13 +1,9 @@
-"""Denoising U-Net: MONAI MAISI U-Net + pooled-text AdaGN conditioning + padding-masked cross-attention.
+"""Denoising U-Net built on MONAI's `DiffusionModelUNetMaisi` (16-channel Wan latent).
 
-``ReportUNet3D`` keeps every MONAI ``DiffusionModelUNetMaisi`` layer (so ``state_dict`` keys are the stock names) and
-changes three things in place:
-
-* a zero-initialised ``text_pooled_proj`` adds the pooled report vector into the leading ``time_embed_dim`` columns
-  of ``emb`` (spacing columns untouched);
-* every ``DiffusionUNetResnetBlock`` becomes an ``AdaGNResBlock`` (scale + shift after ``norm2``, as in the
-  ``scale_shift`` ResNet block of diffusers / ADM);
-* every ``CrossAttentionBlock`` becomes a ``MaskedCrossAttention`` that ignores right-padded context tokens.
+Both tracks use `DiffusionModelUNetMaisiTextPooledAdaGN`:
+    - local text path : token sequence -> cross-attention (with a key-padding mask)
+    - global text path: pooled text vector -> zero-init Linear, added to the timestep embedding
+    - every ResBlock consumes the conditioning embedding through AdaGN (scale/shift after GroupNorm)
 """
 
 from __future__ import annotations
@@ -18,237 +14,199 @@ from monai.apps.generation.maisi.networks.diffusion_model_unet_maisi import Diff
 from monai.networks.blocks.crossattention import CrossAttentionBlock
 from monai.networks.nets.diffusion_model_unet import DiffusionUNetResnetBlock
 from monai.utils.type_conversion import convert_to_tensor
-from torch import Tensor, nn
+from torch import nn
+
+# U-Net hyper-parameters (MAISI layout, adapted to the 16-channel Wan latent).
+UNET_KWARGS = dict(
+    spatial_dims=3,
+    in_channels=16,
+    out_channels=16,
+    num_channels=[64, 128, 256, 512],
+    num_res_blocks=2,
+    attention_levels=[False, False, True, True],
+    num_head_channels=[0, 0, 32, 32],
+    num_class_embeds=128,
+    include_fc=True,
+    include_spacing_input=True,
+    include_top_region_index_input=False,
+    include_bottom_region_index_input=False,
+    resblock_updown=True,
+    with_conditioning=True,
+)
 
 
-class AdaGNResBlock(DiffusionUNetResnetBlock):
-    """``DiffusionUNetResnetBlock`` with ``emb`` injected as AdaGN (scale + shift after ``norm2``).
+# --------------------------------------------------------------------------------------------
+# Cross-attention with a key-padding mask
+# --------------------------------------------------------------------------------------------
+class MaskedCrossAttentionBlock(CrossAttentionBlock):
+    """`CrossAttentionBlock` that ignores padded context tokens.
 
-    Converted in place by ``enable_adagn`` (``__class__`` swap); declares no ``__init__`` of its own.
+    MONAI's cross-attention has no mask argument and the layers above it do not forward extra
+    kwargs, so the mask is stored on the block (`context_mask`, ``(B, T)`` bool, True = real token)
+    by the owning U-Net right before its forward. Existing blocks are converted in place
+    (`enable_context_masking`), so parameters and state-dict keys are unchanged.
     """
 
-    def forward(self, x: Tensor, emb: Tensor) -> Tensor:
-        """Run the block.
+    context_mask: torch.Tensor | None = None
 
-        Args:
-            x: ``(B, C_in, H, W, D)``.
-            emb: ``(B, emb_channels)``.
+    def forward(self, x: torch.Tensor, context: torch.Tensor | None = None) -> torch.Tensor:
+        mask = self.context_mask
+        if mask is None or context is None:
+            return super().forward(x, context)
 
-        Returns:
-            ``(B, C_out, H', W', D')``.
-        """
-        if emb is None:
-            raise ValueError("AdaGNResBlock requires `emb` (scale_shift has no bias-only fallback).")
-        # DUPLICATION INTENTIONAL: monai/networks/nets/diffusion_model_unet.py DiffusionUNetResnetBlock.forward,
-        # verbatim through conv1; only the temb/norm2 part differs (diffusers ResnetBlock2D "scale_shift").
-        h = x
-        h = self.norm1(h)
-        h = self.nonlinearity(h)
+        q = self.input_rearrange(self.to_q(x))  # (B, heads, N, d)
+        k = self.input_rearrange(self.to_k(context))  # (B, heads, T, d)
+        v = self.input_rearrange(self.to_v(context))  # (B, heads, T, d)
+        if self.attention_dtype is not None:
+            q = q.to(self.attention_dtype)
+            k = k.to(self.attention_dtype)
+        attn_mask = mask.to(device=q.device)[:, None, None, :]  # (B, 1, 1, T)
 
+        if self.use_flash_attention:
+            out = F.scaled_dot_product_attention(
+                query=q, key=k, value=v, attn_mask=attn_mask, scale=self.scale,
+                dropout_p=self.dropout_rate, is_causal=False,
+            )
+        else:
+            att = torch.einsum("blxd,blyd->blxy", q, k) * self.scale
+            att = att.masked_fill(~attn_mask, torch.finfo(att.dtype).min)
+            att = self.drop_weights(att.softmax(dim=-1))
+            out = torch.einsum("bhxy,bhyd->bhxd", att, v)
+
+        out = self.out_rearrange(out)
+        out = self.out_proj(out)
+        return self.drop_output(out)
+
+
+def enable_context_masking(module: nn.Module) -> list[MaskedCrossAttentionBlock]:
+    """Convert every `CrossAttentionBlock` under `module` into a `MaskedCrossAttentionBlock`."""
+    blocks = []
+    for m in module.modules():
+        if isinstance(m, CrossAttentionBlock) and not isinstance(m, MaskedCrossAttentionBlock):
+            m.__class__ = MaskedCrossAttentionBlock
+            m.context_mask = None
+            blocks.append(m)
+    return blocks
+
+
+# --------------------------------------------------------------------------------------------
+# AdaGN ResBlock
+# --------------------------------------------------------------------------------------------
+class AdaGNResnetBlock(DiffusionUNetResnetBlock):
+    """ResBlock that injects `emb` as scale/shift after `norm2` (AdaGN, Dhariwal & Nichol 2021).
+
+    The stock MONAI block adds `emb` as a bias *before* `norm2`, where GroupNorm largely removes it.
+    Same structure as diffusers' ``ResnetBlock2D(time_embedding_norm="scale_shift")``.
+    """
+
+    def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
+        h = self.nonlinearity(self.norm1(x))
         if self.upsample is not None:
             x = self.upsample(x)
             h = self.upsample(h)
         elif self.downsample is not None:
             x = self.downsample(x)
             h = self.downsample(h)
-
         h = self.conv1(h)
 
-        temb = self.time_emb_proj(self.nonlinearity(emb))  # (B, 2*C_out)
-        if self.spatial_dims == 2:
-            temb = temb[:, :, None, None]
-        else:
-            temb = temb[:, :, None, None, None]  # (B, 2*C_out, 1, 1, 1)
-        scale, shift = temb.chunk(2, dim=1)  # (B, C_out, 1, 1, 1) each
+        temb = self.time_emb_proj(self.nonlinearity(emb))  # (B, 2 * C_out)
+        temb = temb[(...,) + (None,) * self.spatial_dims]
+        scale, shift = temb.chunk(2, dim=1)
 
-        h = self.norm2(h)
-        h = h * (1.0 + scale) + shift  # AdaGN after norm2
-
-        h = self.nonlinearity(h)
-        h = self.conv2(h)
-        output: Tensor = self.skip_connection(x) + h
-        return output
+        h = self.norm2(h) * (1.0 + scale) + shift
+        h = self.conv2(self.nonlinearity(h))  # conv2 is zero-initialised by MONAI
+        return self.skip_connection(x) + h
 
 
-def enable_adagn(module: nn.Module) -> list[AdaGNResBlock]:
-    """Convert every ``DiffusionUNetResnetBlock`` under ``module`` into an ``AdaGNResBlock`` in place.
-
-    Each block's ``time_emb_proj`` is replaced by a fresh ``nn.Linear(emb_channels, 2 * out_channels)`` (default
-    PyTorch init, not zero: ``conv2`` is already zero-initialised by MONAI).
-
-    Args:
-        module: module containing MONAI diffusion ResBlocks.
-
-    Returns:
-        The converted blocks, in ``modules()`` order.
-    """
-    converted: list[AdaGNResBlock] = []
-    for submodule in module.modules():
-        if isinstance(submodule, DiffusionUNetResnetBlock) and not isinstance(submodule, AdaGNResBlock):
-            submodule.time_emb_proj = nn.Linear(submodule.emb_channels, 2 * submodule.out_channels)
-            submodule.__class__ = AdaGNResBlock
-            converted.append(submodule)
-    return converted
+def enable_adagn(module: nn.Module) -> list[AdaGNResnetBlock]:
+    """Convert every `DiffusionUNetResnetBlock` under `module` into an `AdaGNResnetBlock`."""
+    blocks = []
+    for m in module.modules():
+        if isinstance(m, DiffusionUNetResnetBlock) and not isinstance(m, AdaGNResnetBlock):
+            m.time_emb_proj = nn.Linear(m.emb_channels, 2 * m.out_channels)
+            m.__class__ = AdaGNResnetBlock
+            blocks.append(m)
+    return blocks
 
 
-class MaskedCrossAttention(CrossAttentionBlock):
-    """``CrossAttentionBlock`` that honours a key-padding mask stored on the instance.
+# --------------------------------------------------------------------------------------------
+# U-Net with a pooled (global) text path
+# --------------------------------------------------------------------------------------------
+class DiffusionModelUNetMaisiTextPooled(DiffusionModelUNetMaisi):
+    """`DiffusionModelUNetMaisi` + a zero-initialised pooled-text embedding path.
 
-    Adds no parameters; converted in place by ``enable_context_masking``. The mask is set by the owning U-Net
-    before each forward because the MONAI layers in between only forward ``context``.
-    """
-
-    #: ``(B, T_context)`` bool, ``True`` = real token. ``None`` = stock behaviour.
-    context_mask: Tensor | None = None
-
-    def forward(self, x: Tensor, context: Tensor | None = None) -> Tensor:
-        """Cross-attend ``x`` to ``context``, ignoring padded context positions.
-
-        Args:
-            x: query sequence ``(B, N, C)``.
-            context: key/value sequence ``(B, T, context_dim)``.
-
-        Returns:
-            ``(B, N, C)``.
-        """
-        mask = self.context_mask
-        if mask is None or context is None:
-            return super().forward(x, context)
-
-        # DUPLICATION INTENTIONAL: monai/networks/blocks/crossattention.py CrossAttentionBlock.forward,
-        # plus the key-padding mask (rel_positional_embedding is unused in this U-Net).
-        if self.causal:
-            raise NotImplementedError("MaskedCrossAttention does not support causal=True with a context mask.")
-
-        q = self.input_rearrange(self.to_q(x))  # (B, heads, N, head_dim)
-        k = self.input_rearrange(self.to_k(context))  # (B, heads, T, head_dim)
-        v = self.input_rearrange(self.to_v(context))  # (B, heads, T, head_dim)
-        if self.attention_dtype is not None:
-            q = q.to(self.attention_dtype)
-            k = k.to(self.attention_dtype)
-
-        attn_mask = mask.to(device=q.device)[:, None, None, :]  # (B, 1, 1, T) bool, True = attend
-
-        if self.use_flash_attention:
-            out = F.scaled_dot_product_attention(
-                query=q,
-                key=k,
-                value=v,
-                attn_mask=attn_mask,
-                scale=self.scale,
-                dropout_p=self.dropout_rate,
-                is_causal=False,
-            )
-        else:
-            att_mat = torch.einsum("blxd,blyd->blxy", q, k) * self.scale  # (B, heads, N, T)
-            # finfo.min rather than -inf: an all-padding row degrades to uniform instead of NaN.
-            att_mat = att_mat.masked_fill(~attn_mask, torch.finfo(att_mat.dtype).min)
-            att_mat = att_mat.softmax(dim=-1)
-            att_mat = self.drop_weights(att_mat)
-            out = torch.einsum("bhxy,bhyd->bhxd", att_mat, v)  # (B, heads, N, head_dim)
-
-        out = self.out_rearrange(out)  # (B, N, heads*head_dim)
-        out = self.out_proj(out)
-        out = self.drop_output(out)
-        return out
-
-
-def enable_context_masking(module: nn.Module) -> list[MaskedCrossAttention]:
-    """Convert every ``CrossAttentionBlock`` under ``module`` into a ``MaskedCrossAttention`` in place.
+    The pooled findings/impression vectors are projected to `time_embed_dim` and added to the
+    timestep+class segment of `emb` (the spacing segment is left untouched).
 
     Args:
-        module: module containing cross-attention blocks.
-
-    Returns:
-        The converted blocks, in ``modules()`` order.
-    """
-    converted: list[MaskedCrossAttention] = []
-    for submodule in module.modules():
-        if isinstance(submodule, CrossAttentionBlock) and not isinstance(submodule, MaskedCrossAttention):
-            submodule.__class__ = MaskedCrossAttention
-            submodule.context_mask = None
-            converted.append(submodule)
-    return converted
-
-
-class ReportUNet3D(DiffusionModelUNetMaisi):
-    """MAISI U-Net + zero-init pooled-text ``emb`` path + masked cross-attention + AdaGN ResBlocks.
-
-    Args:
-        *args, **kwargs: forwarded to ``DiffusionModelUNetMaisi.__init__``.
-        text_pooled_dim: width of the concatenated pooled text vector (4096 = 2 sections x 2048).
+        text_pooled_dim: input width of `text_pooled_proj`.
+        text_pooled_concat: concatenate findings and impression before the projection (keeps the
+            two sections distinguishable) instead of projecting each and summing.
     """
 
-    def __init__(self, *args: object, text_pooled_dim: int, **kwargs: object) -> None:
-        # Order is load-bearing: it fixes the parameter-init RNG order and the state_dict keys.
+    def __init__(self, *args, text_pooled_dim: int = 4096, text_pooled_concat: bool = False, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # DUPLICATION INTENTIONAL: time_embed_dim = num_channels[0] * 4 as in DiffusionModelUNetMaisi.__init__.
         self.time_embed_dim = self.block_out_channels[0] * 4
+        self.text_pooled_concat = text_pooled_concat
         self.text_pooled_proj = nn.Linear(text_pooled_dim, self.time_embed_dim)
         nn.init.zeros_(self.text_pooled_proj.weight)
         nn.init.zeros_(self.text_pooled_proj.bias)
         self._xattn_blocks = enable_context_masking(self)
-        self._adagn_blocks = enable_adagn(self)
 
     def forward(
         self,
-        x: Tensor,
-        timesteps: Tensor,
-        context: Tensor | None = None,
-        class_labels: Tensor | None = None,
-        down_block_additional_residuals: tuple[Tensor] | None = None,
-        mid_block_additional_residual: Tensor | None = None,
-        top_region_index_tensor: Tensor | None = None,
-        bottom_region_index_tensor: Tensor | None = None,
-        spacing_tensor: Tensor | None = None,
-        text_pooled_f: Tensor | None = None,
-        text_pooled_i: Tensor | None = None,
-        context_mask: Tensor | None = None,
-    ) -> Tensor:
-        """Predict the velocity.
+        x: torch.Tensor,
+        timesteps: torch.Tensor,
+        context: torch.Tensor | None = None,
+        class_labels: torch.Tensor | None = None,
+        down_block_additional_residuals: tuple[torch.Tensor] | None = None,
+        mid_block_additional_residual: torch.Tensor | None = None,
+        top_region_index_tensor: torch.Tensor | None = None,
+        bottom_region_index_tensor: torch.Tensor | None = None,
+        spacing_tensor: torch.Tensor | None = None,
+        text_pooled_f: torch.Tensor | None = None,
+        text_pooled_i: torch.Tensor | None = None,
+        context_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Same as the base forward, plus pooled text in `emb` and a cross-attention mask.
 
         Args:
-            x: noisy latent ``(B, 16, 64, 64, 64)``.
-            timesteps: ``(B,)`` float in ``[0, 1000]``.
-            context: text tokens ``(B, T, 1024)``.
-            class_labels: ``(B,)`` long.
-            down_block_additional_residuals, mid_block_additional_residual, top_region_index_tensor,
-                bottom_region_index_tensor: as in ``DiffusionModelUNetMaisi.forward``.
-            spacing_tensor: ``(B, 3)`` voxel spacing in mm x 100.
-            text_pooled_f: pooled findings vector ``(B, 2048)``.
-            text_pooled_i: pooled impression vector ``(B, 2048)``.
-            context_mask: ``(B, T)`` bool, ``True`` = real token; ``None`` attends to every position.
-
-        Returns:
-            ``(B, 16, 64, 64, 64)``.
+            text_pooled_f / text_pooled_i: pooled findings / impression vectors ``(B, D)``.
+            context_mask: ``(B, T)`` bool key-padding mask over `context` (True = real token).
         """
-        # Set unconditionally (also None) and never cleared, so activation-checkpoint recomputation sees it too.
         for block in self._xattn_blocks:
             block.context_mask = context_mask
 
-        # DUPLICATION INTENTIONAL: monai/apps/generation/maisi/networks/diffusion_model_unet_maisi.py
-        # DiffusionModelUNetMaisi.forward, extended by the pooled-text block.
-        emb = self._get_time_and_class_embedding(x, timesteps, class_labels)  # (B, 256)
-        emb = self._get_input_embeddings(
-            emb, top_region_index_tensor, bottom_region_index_tensor, spacing_tensor
-        )  # (B, 512) = [time+class | spacing]
-        if text_pooled_f is not None and text_pooled_i is not None:
-            pooled = torch.cat([text_pooled_f.flatten(1), text_pooled_i.flatten(1)], dim=1)  # (B, 4096)
-            text_terms = [self.text_pooled_proj(pooled)]  # (B, 256)
+        emb = self._get_time_and_class_embedding(x, timesteps, class_labels)
+        emb = self._get_input_embeddings(emb, top_region_index_tensor, bottom_region_index_tensor, spacing_tensor)
+
+        if self.text_pooled_concat and text_pooled_f is not None and text_pooled_i is not None:
+            terms = [self.text_pooled_proj(torch.cat([text_pooled_f.flatten(1), text_pooled_i.flatten(1)], dim=1))]
         else:
-            text_terms = [self.text_pooled_proj(t.flatten(1)) for t in (text_pooled_f, text_pooled_i) if t is not None]
-        if text_terms:
-            text_emb = sum(text_terms)  # (B, 256)
-            emb = emb + F.pad(text_emb, (0, emb.shape[1] - text_emb.shape[1]))  # text only in leading columns
+            terms = [self.text_pooled_proj(t.flatten(1)) for t in (text_pooled_f, text_pooled_i) if t is not None]
+        if terms:
+            text_emb = sum(terms)  # (B, time_embed_dim)
+            emb = emb + F.pad(text_emb, (0, emb.shape[1] - text_emb.shape[1]))
+
         h = self.conv_in(x)
-        h, _updated_down_block_res_samples = self._apply_down_blocks(h, emb, context, down_block_additional_residuals)
-        h = self.middle_block(h, emb, context)  # (B, 512, 8, 8, 8)
+        h, res = self._apply_down_blocks(h, emb, context, down_block_additional_residuals)
+        h = self.middle_block(h, emb, context)
         if mid_block_additional_residual is not None:
             h += mid_block_additional_residual
-        h = self._apply_up_blocks(h, emb, context, _updated_down_block_res_samples)
+        h = self._apply_up_blocks(h, emb, context, res)
         h = self.out(h)
-        h_tensor: Tensor = convert_to_tensor(h)
-        return h_tensor
+        return convert_to_tensor(h)
 
 
-__all__ = ["AdaGNResBlock", "MaskedCrossAttention", "ReportUNet3D", "enable_adagn", "enable_context_masking"]
+class DiffusionModelUNetMaisiTextPooledAdaGN(DiffusionModelUNetMaisiTextPooled):
+    """`DiffusionModelUNetMaisiTextPooled` whose ResBlocks use AdaGN (train from scratch only)."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._adagn_blocks = enable_adagn(self)
+
+
+def build_unet(cross_attention_dim: int, text_pooled_dim: int, use_flash_attention: bool = False) -> nn.Module:
+    """Build the released U-Net (for inference); both tracks share the architecture."""
+    kwargs = dict(UNET_KWARGS, cross_attention_dim=cross_attention_dim, use_flash_attention=use_flash_attention)
+    return DiffusionModelUNetMaisiTextPooledAdaGN(**kwargs, text_pooled_dim=text_pooled_dim, text_pooled_concat=True)

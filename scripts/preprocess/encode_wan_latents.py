@@ -1,8 +1,16 @@
-"""Encode CT volumes to Wan2.1 VAE latents: ``<out-dir>/<id>.nii.gz``, float32 ``(64, 64, 64, 16)``.
+"""Encode volumes into Wan2.1 latents.
 
-CT (X, Y, Z) -> resample (512, 512, 253) -> (T=Z, H=X, W=Y) -> WanVAE.encode (16, 64, 64, 64)
--> "c d h w -> h w d c" (64, 64, 64, 16), saved with the affine of the resampled grid (so the
-header zooms are the resampled voxel size, read later as the spacing condition).
+Each volume is reoriented to RAS and resampled to 512 x 512 x 253 (X, Y, Z), then encoded to a
+(16, 64, 64, 64) latent and saved as ``<out-dir>/<id>_emb.nii.gz`` with shape (H, W, D, C). The
+NIfTI affine keeps the resampled voxel spacing, which build_datalist.py reads as the spacing
+condition.
+
+    # CT-RATE (HU)
+    python scripts/preprocess/encode_wan_latents.py --ids ids/ctrate_train.txt \
+        --data-root /path/CT-RATE/dataset/train_fixed --layout ctrate --out-dir data/ctgen/latents
+    # MR-RATE (per-volume percentile normalisation)
+    python scripts/preprocess/encode_wan_latents.py --ids data/mrgen/ids_train.json \
+        --data-root data/mrgen/raw --layout mrrate --intensity unit --out-dir data/mrgen/latents
 """
 
 from __future__ import annotations
@@ -11,54 +19,69 @@ import argparse
 import sys
 from pathlib import Path
 
+import monai.transforms as mt
+import nibabel as nib
+import numpy as np
 import rootutils
+import torch
+from einops import rearrange
+from tqdm import tqdm
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
-import nibabel as nib  # noqa: E402
-import numpy as np  # noqa: E402
-from einops import rearrange  # noqa: E402
-from tqdm import tqdm  # noqa: E402
-
-from scripts.preprocess.common import add_volume_args, resample_ct, select_ids  # noqa: E402
-from src.data.ct_rate import volume_path  # noqa: E402
+from src.data import mr_rate  # noqa: E402
 from src.encoders.wan_vae import DEFAULT_WAN_HF_ID, WanVAE  # noqa: E402
+from scripts.preprocess.common import ID_TO_PATH, read_ids  # noqa: E402
+
+IN_PLANE, DEPTH = 512, 253  # 253 = 1 mod 4 -> lossless 4x temporal compression (64 latent frames)
+
+
+def resample_transform(in_plane: int = IN_PLANE, depth: int = DEPTH) -> mt.Compose:
+    return mt.Compose([
+        mt.LoadImaged(keys="image"),
+        mt.EnsureChannelFirstd(keys="image"),
+        mt.Orientationd(keys="image", axcodes="RAS"),
+        mt.EnsureTyped(keys="image", dtype=torch.float32),
+        mt.Resized(keys="image", spatial_size=(in_plane, in_plane, depth), mode="trilinear"),
+    ])
 
 
 def main() -> None:
-    """Encode every selected id that has no latent yet."""
-    p = argparse.ArgumentParser(description=__doc__)
-    add_volume_args(p)
-    p.add_argument("--hf-id", default=DEFAULT_WAN_HF_ID, help="Wan VAE Hugging Face repo")
-    args = p.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ids", required=True, help=".txt (one id per line) or .json ({'ids': [...]})")
+    ap.add_argument("--data-root", required=True)
+    ap.add_argument("--layout", choices=sorted(ID_TO_PATH), default="ctrate")
+    ap.add_argument("--intensity", choices=["hu", "unit"], default="hu")
+    ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--hf-id", default=DEFAULT_WAN_HF_ID)
+    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--num-shards", type=int, default=1)
+    ap.add_argument("--shard", type=int, default=0)
+    args = ap.parse_args()
 
-    ids = select_ids(args)
+    ids = read_ids(args.ids)[args.shard :: args.num_shards]
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    to_path = ID_TO_PATH[args.layout]
+    transform = resample_transform()
     vae = WanVAE(hf_id=args.hf_id, device=args.device)
 
-    done = skipped = failed = 0
     for vol_id in tqdm(ids, desc="wan latents"):
-        out_path = out_dir / f"{vol_id}.nii.gz"
+        out_path = out_dir / f"{vol_id}_emb.nii.gz"
         if out_path.exists():
-            skipped += 1
             continue
-        src = volume_path(args.data_root, vol_id)
+        src = to_path(vol_id, args.data_root)
         if not src.is_file():
-            print(f"[miss] {vol_id}: {src}", file=sys.stderr)
-            failed += 1
+            print(f"missing: {src}", file=sys.stderr)
             continue
-        try:
-            vol, affine = resample_ct(src)  # (1, 512, 512, 253), (4, 4)
-            ct_thw = vol[0].permute(2, 0, 1).contiguous()  # (253, 512, 512)
-            z = vae.encode(ct_thw)  # (16, 64, 64, 64) = (C, D_lat, H_lat, W_lat)
-            hwdc = rearrange(z.numpy(), "c d h w -> h w d c")  # (64, 64, 64, 16)
-            nib.save(nib.Nifti1Image(np.float32(hwdc), affine=affine), str(out_path))
-            done += 1
-        except Exception as exc:  # noqa: BLE001 - one bad volume must not stop the run
-            print(f"[fail] {vol_id}: {type(exc).__name__}: {exc}", file=sys.stderr)
-            failed += 1
-    print(f"done={done} skipped={skipped} failed={failed} -> {out_dir}")
+        img = transform({"image": str(src)})["image"]  # (1, 512, 512, 253)
+        x = img.numpy().squeeze()
+        if args.intensity == "unit":
+            x = mr_rate.normalize_percentile(x)
+        vol_thw = torch.from_numpy(x).permute(2, 0, 1).contiguous()  # (253, 512, 512)
+        z = vae.encode(vol_thw, intensity=args.intensity)  # (16, 64, 64, 64)
+        hwdc = rearrange(z.numpy(), "c d h w -> h w d c")  # (64, 64, 64, 16)
+        nib.save(nib.Nifti1Image(np.float32(hwdc), affine=img.meta["affine"].numpy()), str(out_path))
 
 
 if __name__ == "__main__":
